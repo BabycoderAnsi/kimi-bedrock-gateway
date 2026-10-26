@@ -155,3 +155,75 @@ def test_kimi_api_and_effort_defaults_and_validation():
         t = common.default_settings()
         t.update(bad)
         assert any(i.level == "error" for i in common.validate_settings(t))
+
+
+APP_ARN = "arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/abc123xyz"
+
+
+def test_application_profile_forces_converse_and_back():
+    s = common.default_settings()
+    common.set_kimi_model(s, APP_ARN)
+    assert s["kimi_api"] == "converse"
+    assert [i for i in common.validate_settings(s) if i.level == "error"] == []
+    cfg = yaml.safe_load(common.render_runtime_config(s))
+    assert cfg["model_list"][0]["litellm_params"]["model"] == f"bedrock/converse/{APP_ARN}"
+    common.set_kimi_model(s, "in.moonshotai.kimi-k3")
+    assert s["kimi_api"] == "chat_completions"
+
+
+def test_application_profile_rejects_chat_completions_and_region_mismatch():
+    s = dict(common.default_settings(), bedrock_model_id=APP_ARN)  # kimi_api left at chat_completions
+    errors = [i.message for i in common.validate_settings(s) if i.level == "error"]
+    assert any("Chat Completions API does not accept" in e for e in errors)
+    s = dict(common.default_settings(), bedrock_model_id=APP_ARN, kimi_api="converse", aws_region="us-east-1")
+    errors = [i.message for i in common.validate_settings(s) if i.level == "error"]
+    assert any("is in ap-south-1 but aws_region is us-east-1" in e for e in errors)
+
+
+def test_access_key_auth_renders_env_references_only():
+    s = dict(common.default_settings(), aws_auth="access_key", classifier=dict(
+        common.default_settings()["classifier"], backend="bedrock"))
+    assert [i for i in common.validate_settings(s) if i.level == "error"] == []
+    text = common.render_runtime_config(s)
+    cfg = yaml.safe_load(text)
+    for entry in cfg["model_list"]:  # Kimi and the shared-credential classifier route
+        params = entry["litellm_params"]
+        assert params["aws_access_key_id"] == "os.environ/KGW_AWS_ACCESS_KEY_ID"
+        assert params["aws_secret_access_key"] == "os.environ/KGW_AWS_SECRET_ACCESS_KEY"
+        assert "api_key" not in params
+    assert [i for i in common.validate_settings(dict(s, aws_auth="sso")) if i.level == "error"]
+
+
+def test_aws_keys_repr_hides_secret():
+    keys = common.AwsKeys("AKIA" + "ABCDEFGHIJKLMNOP", "s" * 40)  # kgw-scan: allow (fake test key)
+    assert "s" * 40 not in repr(keys) and "ABCDEFGHIJKLMNOP" not in repr(keys)
+
+
+CLAUDE_ARN = "arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/zzz999"
+
+
+def test_classifier_application_profile_renders_base_model_and_model_id():
+    s = common.default_settings()
+    s["classifier"].update(backend="bedrock", bedrock_model_id=CLAUDE_ARN)
+    assert [i for i in common.validate_settings(s) if i.level == "error"] == []
+    route = yaml.safe_load(common.render_runtime_config(s))["model_list"][1]
+    assert route["model_name"] == "claude-sonnet-5"
+    assert route["litellm_params"]["model"] == "bedrock/anthropic.claude-sonnet-5"
+    assert route["litellm_params"]["model_id"] == CLAUDE_ARN
+
+
+@pytest.mark.parametrize("change,needle", [
+    ({"base_model": "moonshotai.kimi-k3"}, "is not a Claude model"),
+    ({"bedrock_model_id": CLAUDE_ARN.replace("ap-south-1", "us-east-1")}, "not in ap-south-1"),
+])
+def test_classifier_application_profile_validation(change, needle):
+    s = common.default_settings()
+    s["classifier"].update({"backend": "bedrock", "bedrock_model_id": CLAUDE_ARN, **change})
+    assert any(needle in i.message for i in common.validate_settings(s) if i.level == "error")
+
+
+def test_classifier_cannot_reuse_the_kimi_arn():
+    s = common.default_settings()
+    common.set_kimi_model(s, APP_ARN)
+    s["classifier"].update(backend="bedrock", bedrock_model_id=APP_ARN)
+    assert any("same ARN as the Kimi model" in i.message for i in common.validate_settings(s) if i.level == "error")

@@ -148,6 +148,51 @@ def test_converse_fallback_setting(tmp_path):
         gw.close()
 
 
+def test_application_inference_profile_uses_converse(tmp_path):
+    if not VENV_PY.exists():
+        pytest.skip("project venv not installed")
+    arn = "arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/abc123xyz"
+    gw = Gateway(tmp_path, extra_settings={"bedrock_model_id": arn, "kimi_api": "converse"})
+    try:
+        cached = {"system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+                  "messages": MULTI_TURN["messages"][:-1] + [{"role": "user", "content": [
+                      {"type": "text", "text": "again", "cache_control": {"type": "ephemeral"}}]}]}
+        status, body = gw.post({**MULTI_TURN, **CLAUDE_CODE_EFFORT, **cached})
+        assert status == 200, body
+        rec = gw.mock_requests()[-1]
+        assert (rec["op"], rec["model"]) == ("converse", arn)
+        assert '"cachePoint"' not in json.dumps(rec["body"])  # LiteLLM would add one behind an ARN
+        assert "(?!" not in json.dumps(rec["body"]["toolConfig"])  # LiteLLM can't tell it's Kimi; the hook still strips
+    finally:
+        gw.close()
+
+
+def test_access_key_auth_signs_every_request(tmp_path):
+    """set-auth access-key: the manager's probe and LiteLLM's calls are both SigV4-signed and verified."""
+    if not VENV_PY.exists():
+        pytest.skip("project venv not installed")
+    sys.path.insert(0, str(ROOT / "tests"))
+    from mock_bedrock import VALID_ACCESS_KEY_ID, VALID_SECRET_ACCESS_KEY  # noqa: PLC0415
+    arn = "arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/abc123xyz"
+    gw = Gateway(tmp_path, extra_settings={"bedrock_model_id": arn, "kimi_api": "converse"})
+    try:
+        bad = gw.manage("set-auth", "access-key", input_text=f"{VALID_ACCESS_KEY_ID}\n{'x' * 40}\n", check=False)
+        assert "not saved" in bad and json.loads((gw.home / "settings.json").read_text())["aws_auth"] == "bearer"
+        out = gw.manage("set-auth", "access-key", "--restart",
+                        input_text=f"{VALID_ACCESS_KEY_ID}\n{VALID_SECRET_ACCESS_KEY}\n")
+        assert "answered" in out and VALID_SECRET_ACCESS_KEY not in out and VALID_ACCESS_KEY_ID not in out
+        assert "aws_secret_access_key: os.environ/KGW_AWS_SECRET_ACCESS_KEY" in \
+            (gw.home / "runtime" / "litellm-config.yaml").read_text()
+        status, body = gw.post(MULTI_TURN)
+        assert status == 200, body
+        rec = gw.mock_requests()[-1]
+        assert (rec["op"], rec["auth"], rec["token_valid"]) == ("converse", "sigv4", True)
+        doctor = gw.manage("doctor", "--live")
+        assert "aws-secret-access-key: stored" in doctor and "answered" in doctor
+    finally:
+        gw.close()
+
+
 def test_classifier_requests_never_reach_kimi(gateway):
     body = {"model": "kimi-k3", "max_tokens": 64, "stop_sequences": ["</block>"],
             "system": "You are a security monitor for autonomous AI coding agents.",
@@ -223,6 +268,35 @@ def test_auto_mode_classifier_allows_harmless_command(tmp_path):
         assert result["permission_denials"] == []
         classifier_calls = [r for r in gw.mock_requests() if "security monitor" in json.dumps(r["body"])]
         assert classifier_calls and all(r["model"] == "in.anthropic.claude-sonnet-5" for r in classifier_calls)
+    finally:
+        gw.close()
+
+
+@needs_claude
+def test_auto_mode_with_application_profiles_and_access_keys(tmp_path):
+    """Kimi and the classifier each behind an application-profile ARN, SigV4-signed (the ARN-only IAM setup)."""
+    if not VENV_PY.exists():
+        pytest.skip("project venv not installed")
+    sys.path.insert(0, str(ROOT / "tests"))
+    from mock_bedrock import VALID_ACCESS_KEY_ID, VALID_SECRET_ACCESS_KEY  # noqa: PLC0415
+    kimi_arn = "arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/kimi0001"
+    # The mock treats an ARN containing "claude" as a Claude model; real profile IDs are opaque.
+    claude_arn = "arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/claude0001"
+    gw = Gateway(tmp_path, ["--kimi-tool-cmd", 'python3 -c "print(6*7)"', "--classifier-mode", "allow"],
+                 extra_settings={"bedrock_model_id": kimi_arn, "kimi_api": "converse"})
+    try:
+        gw.manage("set-auth", "access-key", input_text=f"{VALID_ACCESS_KEY_ID}\n{VALID_SECRET_ACCESS_KEY}\n")
+        out = gw.manage("classifier", "enable", "--model-id", claude_arn, "--restart")
+        assert "answered" in out, out
+        config = (gw.home / "runtime" / "litellm-config.yaml").read_text()
+        assert f'model_id: "{claude_arn}"' in config and '"bedrock/anthropic.claude-sonnet-5"' in config
+        result = _claude(gw, tmp_path, "--permission-mode", "auto")
+        assert result["permission_denials"] == [], result
+        reqs = gw.mock_requests()
+        classifier_calls = [r for r in reqs if "security monitor" in json.dumps(r["body"])]
+        assert classifier_calls and all(r["model"] == claude_arn for r in classifier_calls)
+        assert all(r["auth"] == "sigv4" and r["token_valid"] for r in reqs if r["model"] in (kimi_arn, claude_arn))
+        assert any(r["model"] == kimi_arn for r in reqs)
     finally:
         gw.close()
 

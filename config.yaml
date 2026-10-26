@@ -15,7 +15,7 @@ model_list:
     litellm_params:
       model: __BEDROCK_MODEL__
       aws_region_name: __AWS_REGION__
-      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK__ENDPOINT_LINE__
+      __AUTH_LINES____ENDPOINT_LINE__
 __CLASSIFIER_BLOCK__
 litellm_settings:
   # Kimi K3 compatibility adapter + auto-mode classifier routing guard.

@@ -125,7 +125,7 @@ printf '%s\n' "$TOKEN" | ./setup.sh --non-interactive --token-stdin --region ap-
 
 | What | Where |
 |---|---|
-| Bedrock token, master key, classifier keys | **Windows Credential Manager** / **macOS Keychain** / **Secret Service (libsecret)**, service name `kimi-bedrock-gateway`. Optional fallback: a user-only `secrets.json` file (see below) |
+| Bedrock token or AWS access key pair, master key, classifier keys | **Windows Credential Manager** / **macOS Keychain** / **Secret Service (libsecret)**, service name `kimi-bedrock-gateway`. Optional fallback: a user-only `secrets.json` file (see below) |
 | Settings (non-secret) | `~/.config/kimi-bedrock-gateway/settings.json` (Linux/macOS), `%APPDATA%\kimi-bedrock-gateway\settings.json` (Windows); created with mode 0600, or a current-user-only ACL on Windows |
 | Rendered LiteLLM config, PID file, background log, backups | Same private directory: `runtime/`, `run/`, `logs/`, `backups/` |
 | Application defaults | `config.yaml` (template) and `scripts/common.py` (`DEFAULT_SETTINGS`), both in the repo |
@@ -227,6 +227,38 @@ Kimi route as eligible for Claude-only duties.
 The proxy master key is separate. Rotate it with `./gateway.sh rotate-master-key`, then relaunch
 Claude Code.
 
+### Using an IAM access key pair instead of a Bedrock API key
+
+If your account can't use Bedrock API keys, the gateway can sign requests with an IAM user's access
+key ID and secret access key instead (AWS Signature Version 4). One case is an IAM user without
+`bedrock:CallWithBearerToken`. This mode doesn't need that permission.
+
+```bash
+./gateway.sh set-auth access-key --restart     # prompts for the key ID and secret (hidden)
+./gateway.sh doctor --live
+./gateway.sh set-auth bearer                   # switch back; --forget-access-key deletes the pair
+# or at install time:
+./setup.sh --auth access-key
+```
+
+- The key ID and secret are stored like the bearer token: in the OS credential store, or the 0600
+  file fallback. They're validated with one signed request before they're saved, and a pair that
+  fails validation is not saved.
+- The LiteLLM config refers to them only as `os.environ/KGW_AWS_ACCESS_KEY_ID` and
+  `os.environ/KGW_AWS_SECRET_ACCESS_KEY`. Output shows only the last four characters of the key ID
+  and a fingerprint of the secret.
+- The auto-mode classifier route uses the same pair unless it has a separate credential.
+- Only long-term IAM user keys (`AKIA…`) are supported. Temporary credentials (`ASIA…` plus a
+  session token) and AWS CLI profiles or SSO are not.
+- Least privilege: the user needs only `bedrock:InvokeModel*` on the Kimi profile and its foundation
+  model. A long-lived secret key is a stronger credential than a Bedrock API key that's scoped to
+  Bedrock, so rotate it regularly.
+
+Verified live on 2026-10-26: setup with `--auth access-key` validated the pair, `doctor --live` passed,
+and Claude Code 2.1.310 through the gateway answered "hello" and ran a Bash tool call. The target was an
+application inference profile in ap-south-1. Neither key value appeared in the logs or the rendered
+config. Offline, the mock Bedrock re-verifies every SigV4 signature (the manager's own signer and LiteLLM's).
+
 ## 6. Change Region or model
 
 ```bash
@@ -244,6 +276,39 @@ live in `settings.json`. Validate them with `./gateway.sh config validate`, then
 | ap-south-1, ap-south-2 | `in.moonshotai.kimi-k3` | `in.anthropic.claude-sonnet-5` |
 | us-east-1/2, us-west-1/2, ca-central-1, ca-west-1 | `us.moonshotai.kimi-k3` | `us.anthropic.claude-sonnet-5` |
 | any other commercial Region in the model card | `global.moonshotai.kimi-k3` | `eu.`/`au.`/`global.anthropic.claude-sonnet-5` |
+
+### Application inference profiles (admin-managed ARNs)
+
+Some organisations only allow Kimi K3 through an *application inference profile* their admin
+created. You can recognise one in your IAM policy: the resource looks like
+`arn:aws:bedrock:<region>:<account>:application-inference-profile/<id>`, and the foundation-model
+statement has a `bedrock:InferenceProfileArn` condition. With a policy like that, `in.`, `global.`
+and the bare model ID are all denied, so use the ARN as the model ID:
+
+```bash
+./setup.sh --model-id arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/abc123
+# or, on an existing install:
+./gateway.sh set-region ap-south-1 --model-id arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/abc123
+```
+
+The gateway then switches `kimi_api` to `converse`, because Bedrock's Chat Completions API rejects
+application profiles ("Application inference profiles are not supported by this API"). Going back to
+an `in.`/`global.` profile switches it back to Chat Completions. On Converse,
+`kimi_reasoning_effort` has no reliable effect and the explicit `prompt_cache_breakpoint` markers
+aren't used. Bedrock still caches repeated prefixes on its own: in a live test, 10,218 of 10,339
+prompt tokens were served from cache by the third request. The gateway also strips Claude Code's
+`cache_control` markers on this route. LiteLLM can't tell that the ARN is Kimi, so it would turn them
+into `cachePoint` fields, which Kimi rejects.
+
+**Bearer keys also need `bedrock:CallWithBearerToken`.** A Bedrock API key acts as its IAM user,
+and that user needs this permission in addition to `bedrock:InvokeModel*`. The
+`AmazonBedrockLimitedAccess` managed policy includes it. Without it, every call fails with
+`bearer_token_not_allowed`.
+
+Verified live on 2026-10-26 with Claude Code 2.1.303 against a real application profile in
+ap-south-1: a "hello" took 2.8 s, and a Bash tool call ran and returned its output. These requests
+were signed with the same IAM user's access keys, because the API key under test still lacked
+`bedrock:CallWithBearerToken`. The bearer-token path through an ARN is covered only by the offline tests.
 
 ### Latency and reasoning effort
 
@@ -355,6 +420,49 @@ displays:
   * the `claude-sonnet-5` route **accepts only classifier-shaped requests**, so coding traffic can't
     silently move from Kimi to Claude.
 
+### Classifier behind an application inference profile
+
+If your IAM policy only allows models through application inference profiles (see §6), the
+classifier needs one of its own. It must point at a **Claude** model, separate from the Kimi profile:
+
+```bash
+./gateway.sh classifier enable --model-id arn:aws:bedrock:ap-south-1:<account>:application-inference-profile/<claude-id> --restart
+# if the profile points at a Claude model other than Sonnet 5:
+#   ... --base-model anthropic.claude-opus-4-7
+```
+
+An ARN doesn't say which model is behind it, so the gateway renders the route with the Claude model
+for request formatting and the ARN as the target:
+
+```yaml
+  - model_name: "claude-sonnet-5"          # what Claude Code requests for the classifier
+    litellm_params:
+      model: "bedrock/anthropic.claude-sonnet-5"   # classifier.base_model
+      model_id: "arn:aws:bedrock:...:application-inference-profile/<claude-id>"
+```
+
+Setup refuses a `base_model` that isn't Claude, a profile in another Region, and a classifier ARN that
+equals the Kimi ARN. Before saving, `classifier enable` sends one real request to the profile; if it
+fails, Auto Mode stays off. The route uses the gateway's credential (bearer token or access key pair).
+
+**What an admin has to provide.** This only works if the IAM user may invoke a Claude model. For
+example, an admin can copy the system profile into an application profile:
+
+```bash
+aws bedrock create-inference-profile --region ap-south-1 --inference-profile-name kgw-classifier \
+  --model-source copyFrom=arn:aws:bedrock:ap-south-1:<account>:inference-profile/in.anthropic.claude-sonnet-5
+```
+
+They then allow it the same way as the Kimi profile: `bedrock:InvokeModel*` on the new profile ARN,
+plus the foundation model `arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5` with the
+condition `bedrock:InferenceProfileArn` set to the new ARN. Anthropic models may also require the
+account's one-time Anthropic use-case form.
+
+Offline test (real Claude Code 2.1.310, `--permission-mode auto`, mocked Bedrock): Kimi and the
+classifier were each behind their own ARN, and every request was SigV4-signed with an access key pair.
+The harmless command was approved, and every classifier call went to the Claude ARN, none to Kimi.
+**Not yet verified against real Bedrock**, because the account this was built for had no Claude access.
+
 ### Test results (offline, real Claude Code binary, mocked Bedrock: `tests/test_e2e_mock.py`)
 
 | Scenario | Outcome |
@@ -388,6 +496,10 @@ Run `./gateway.sh doctor --live` first. Errors are classified as follows:
 |---|---|---|
 | `invalid_token`: *Authentication failed … API Key is valid* | wrong, expired or revoked Bedrock key (short-term keys last ≤ 12 h) | `./update-bedrock-key.sh --restart` |
 | `model_access_denied`: *don't have access to the model* | key works, but IAM/SCP denies the profile or a destination Region | allow `bedrock:InvokeModel*` on the inference profile **and** the foundation model in Mumbai and Hyderabad (for `in.`) |
+| `model_access_denied`: *not authorized to perform: bedrock:InvokeModel* (Chat Completions reports this as HTTP 401) | the IAM policy doesn't allow this model ID, often because it only allows an application inference profile | use the profile ARN as the model ID (§6, "Application inference profiles") |
+| `bearer_token_not_allowed` | the API key's IAM user lacks `bedrock:CallWithBearerToken` | ask your admin to add it (it's in `AmazonBedrockLimitedAccess`), or use an access key pair: `./gateway.sh set-auth access-key` |
+| `invalid_access_key`: *signature we calculated does not match* / *security token … invalid* | wrong or deactivated access key ID or secret | `./gateway.sh set-auth access-key --replace` |
+| `unsupported_api`: *Application inference profiles are not supported by this API* | an ARN with `kimi_api: chat_completions` | set `"kimi_api": "converse"`, or re-run `set-region … --model-id <ARN>` |
 | `unsupported_model_or_region` / `model_not_found` | profile can't be called from this Region | see the table in §6; `./gateway.sh set-region …` |
 | `throttled` | quota exceeded | wait, or request a quota increase in Service Quotas |
 | `network_error` | can't reach `bedrock-runtime.<region>.amazonaws.com` | check `HTTPS_PROXY`, firewall and DNS |

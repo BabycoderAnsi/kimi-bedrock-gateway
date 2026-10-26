@@ -8,6 +8,9 @@ configured Anthropic API endpoint, or the local proxy - never anywhere else.
 
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -39,8 +42,11 @@ class ProbeResult:
 
 
 def _http(method: str, url: str, headers: dict[str, str], body: dict | None = None,
-          timeout: float = PROBE_TIMEOUT) -> tuple[int, dict[str, str], bytes]:
+          timeout: float = PROBE_TIMEOUT, sign_with: common.AwsKeys | None = None,
+          region: str | None = None) -> tuple[int, dict[str, str], bytes]:
     data = json.dumps(body).encode() if body is not None else None
+    if sign_with is not None:
+        headers = {**headers, **sigv4_headers(method, url, data or b"", region or "", sign_with)}
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     # Never follow redirects with credentials attached.
     opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=_tls_context()))
@@ -49,6 +55,29 @@ def _http(method: str, url: str, headers: dict[str, str], body: dict | None = No
             return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, {k.lower(): v for k, v in (exc.headers or {}).items()}, exc.read() or b""
+
+
+def sigv4_headers(method: str, url: str, body: bytes, region: str, keys: common.AwsKeys,
+                  service: str = "bedrock", now: _dt.datetime | None = None) -> dict[str, str]:
+    """AWS Signature Version 4 headers for one request (stdlib only; signs host and x-amz-date)."""
+    parts = urllib.parse.urlsplit(url)
+    stamp = (now or _dt.datetime.now(_dt.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    date = stamp[:8]
+    # Non-S3 services sign the already-encoded path encoded once more (botocore does the same).
+    canonical_uri = urllib.parse.quote(parts.path or "/", safe="/-_.~")
+    query = "&".join(sorted(parts.query.split("&"))) if parts.query else ""
+    payload_hash = hashlib.sha256(body).hexdigest()
+    canonical = "\n".join([method, canonical_uri, query, f"host:{parts.netloc}", f"x-amz-date:{stamp}", "",
+                           "host;x-amz-date", payload_hash])
+    scope = f"{date}/{region}/{service}/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    key = ("AWS4" + keys.secret_access_key).encode()
+    for part in (date, region, service, "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    return {"x-amz-date": stamp, "x-amz-content-sha256": payload_hash,
+            "Authorization": f"AWS4-HMAC-SHA256 Credential={keys.access_key_id}/{scope}, "
+                             f"SignedHeaders=host;x-amz-date, Signature={signature}"}
 
 
 def _tls_context() -> ssl.SSLContext:
@@ -86,6 +115,24 @@ def classify_bedrock_error(status: int, headers: dict[str, str], raw: bytes, mod
     err_type = headers.get("x-amzn-errortype", "").split(":", 1)[0]
     msg = _message_of(raw)
     low = msg.lower()
+    # IAM denials come back as 403 on Converse/Invoke but as 401 on Chat Completions, so match the
+    # message before treating a 401 as a bad token.
+    if "not authorized to perform" in low and "bedrock:callwithbearertoken" in low:
+        return ProbeResult(False, "bearer_token_not_allowed",
+                           f"The API key is valid but its IAM user may not call Bedrock with a bearer token: {msg}",
+                           "Ask your AWS admin to allow bedrock:CallWithBearerToken for the API key's IAM user "
+                           "(the AmazonBedrockLimitedAccess managed policy includes it).")
+    if "not authorized to perform" in low:
+        hint = ("Check the IAM policy attached to the API key's user (bedrock:InvokeModel and "
+                "bedrock:InvokeModelWithResponseStream on the inference profile and its foundation "
+                "model in every destination Region) and any SCPs. If the policy only allows an application "
+                "inference profile, use its ARN as the model ID (setup --model-id arn:aws:bedrock:...).")
+        return ProbeResult(False, "model_access_denied",
+                           f"The token is valid but cannot invoke {model} in {region}: {msg}", hint)
+    if status == 400 and "application inference profiles are not supported" in low:
+        return ProbeResult(False, "unsupported_api",
+                           f"Bedrock's Chat Completions API does not accept application inference profiles: {msg}",
+                           'Set "kimi_api": "converse" (setup and set-region do this automatically for an ARN).')
     if status == 401 or (status == 403 and ("api key" in low or "authentication" in low or "security token" in low
                                             or "signature" in low or "unrecognizedclient" in err_type.lower())):
         return ProbeResult(False, "invalid_token", f"Bedrock rejected the bearer token: {msg}",
@@ -120,20 +167,28 @@ def classify_bedrock_error(status: int, headers: dict[str, str], raw: bytes, mod
     return ProbeResult(False, "bedrock_error", f"Bedrock returned HTTP {status} {err_type}: {msg}")
 
 
-def probe_bedrock(settings: dict[str, Any], token: str, model_id: str | None = None,
+def probe_bedrock(settings: dict[str, Any], token: str | common.AwsKeys, model_id: str | None = None,
                   kind: str = "kimi") -> ProbeResult:
     """Send one minimal inference request straight to Bedrock with ``token``.
+
+    ``token`` is a bearer token, or an :class:`common.AwsKeys` pair to SigV4-sign the request.
 
     ``kind='kimi'`` uses Converse; ``kind='claude'`` uses InvokeModel with the
     Anthropic Messages body (the path LiteLLM uses for the classifier route).
     """
-    common.register_secret(token)
+    keys = token if isinstance(token, common.AwsKeys) else None
+    if keys:
+        common.register_secret(keys.secret_access_key)
+        common.register_secret(keys.access_key_id)
+    else:
+        common.register_secret(token)
     region = settings["aws_region"]
     model = model_id or settings["bedrock_model_id"]
     base = common.bedrock_runtime_url(settings)
     quoted = urllib.parse.quote(model, safe="")
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
-               "Accept": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if not keys:
+        headers["Authorization"] = f"Bearer {token}"
     if kind == "claude":
         url = f"{base}/model/{quoted}/invoke"
         body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 16,
@@ -150,7 +205,7 @@ def probe_bedrock(settings: dict[str, Any], token: str, model_id: str | None = N
                 "inferenceConfig": {"maxTokens": 64},
                 "additionalModelRequestFields": {"reasoning_effort": "none"}}
     try:
-        status, resp_headers, raw = _http("POST", url, headers, body)
+        status, resp_headers, raw = _http("POST", url, headers, body, sign_with=keys, region=region)
     except urllib.error.URLError as exc:
         reason = getattr(exc, "reason", exc)
         return ProbeResult(False, "network_error", f"Could not reach {base}: {reason}",
@@ -161,7 +216,16 @@ def probe_bedrock(settings: dict[str, Any], token: str, model_id: str | None = N
                            "Check connectivity and retry.")
     if status == 200:
         return ProbeResult(True, "ok", f"{model} answered from {region}.")
-    return classify_bedrock_error(status, resp_headers, raw, model, region)
+    result = classify_bedrock_error(status, resp_headers, raw, model, region)
+    if keys and result.code == "invalid_token":
+        return ProbeResult(False, "invalid_access_key",
+                           f"Bedrock rejected the AWS access key pair: {_message_of(raw)}",
+                           "Check the access key ID and secret access key (IAM > Users > Security credentials), "
+                           "then run: gateway set-auth access-key")
+    if keys:
+        return ProbeResult(result.ok, result.code, result.message.replace("The token is valid", "The access key is valid"),
+                           result.hint)
+    return result
 
 
 def probe_anthropic(api_key: str, model: str) -> ProbeResult:

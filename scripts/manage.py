@@ -192,6 +192,23 @@ def get_secret(store: common.SecretStore, name: str) -> str | None:
     return value
 
 
+def read_access_keys(store: common.SecretStore) -> common.AwsKeys | None:
+    key_id = get_secret(store, common.SECRET_AWS_ACCESS_KEY_ID)
+    secret = get_secret(store, common.SECRET_AWS_SECRET_ACCESS_KEY)
+    return common.AwsKeys(key_id, secret) if key_id and secret else None
+
+
+def bedrock_credential(settings: dict[str, Any], store: common.SecretStore) -> str | common.AwsKeys | None:
+    """The credential the gateway uses for Bedrock: bearer token or access key pair (per aws_auth)."""
+    if settings.get("aws_auth") == "access_key":
+        return read_access_keys(store)
+    return get_secret(store, common.SECRET_BEDROCK_TOKEN)
+
+
+def describe_access_keys(keys: common.AwsKeys) -> str:
+    return f"access key ID ending {keys.access_key_id[-4:]}, secret fingerprint {common.fingerprint(keys.secret_access_key)}"
+
+
 def backup_settings(reason: str) -> Path | None:
     p = common.paths()
     if not p.settings.exists():
@@ -225,19 +242,26 @@ def proxy_state(settings: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_proxy_env(settings: dict[str, Any], store: common.SecretStore) -> dict[str, str]:
-    token = get_secret(store, common.SECRET_BEDROCK_TOKEN)
+    cred = bedrock_credential(settings, store)
     master = get_secret(store, common.SECRET_MASTER_KEY)
-    if not token:
+    if not cred:
+        if settings.get("aws_auth") == "access_key":
+            raise GatewayError("No AWS access key pair is stored.", hint="Run: gateway set-auth access-key",
+                               code="missing_token")
         raise GatewayError("No Bedrock bearer token is stored.", hint="Run update-bedrock-key (or setup).",
                            code="missing_token")
     if not master:
         raise GatewayError("No local proxy master key is stored.", hint="Run setup.", code="missing_master_key")
     env = dict(os.environ)
     for k in ("DATABASE_URL", "LITELLM_MASTER_KEY", "AWS_BEARER_TOKEN_BEDROCK", "KGW_CLASSIFIER_ALIAS",
-              "STORE_MODEL_IN_DB"):
+              "STORE_MODEL_IN_DB", "KGW_AWS_ACCESS_KEY_ID", "KGW_AWS_SECRET_ACCESS_KEY"):
         env.pop(k, None)
+    if isinstance(cred, common.AwsKeys):
+        env["KGW_AWS_ACCESS_KEY_ID"] = cred.access_key_id
+        env["KGW_AWS_SECRET_ACCESS_KEY"] = cred.secret_access_key
+    else:
+        env["AWS_BEARER_TOKEN_BEDROCK"] = cred
     env.update({
-        "AWS_BEARER_TOKEN_BEDROCK": token,
         "LITELLM_MASTER_KEY": master,
         "KGW_PRIMARY_ALIAS": settings["model_alias"],
         "KGW_KIMI_MODEL_ID": settings["bedrock_model_id"],
@@ -440,6 +464,8 @@ def configure_settings(args: argparse.Namespace, settings: dict[str, Any], exist
             settings["credential_backend"] = kept_backend
     if args.credential_backend:
         settings["credential_backend"] = args.credential_backend
+    if not args.region and common.is_application_profile(args.model_id):
+        args.region = common.APP_PROFILE_RE.match(args.model_id).group(1)
     region = args.region or (common.ask("AWS Region for Bedrock", settings["aws_region"])
                              if interactive(args) else settings["aws_region"])
     settings["aws_region"] = region.strip()
@@ -455,9 +481,11 @@ def configure_settings(args: argparse.Namespace, settings: dict[str, Any], exist
                                code="unsupported_model_or_region")
     elif interactive(args) and not args.model_id:
         model = common.ask("Bedrock model / inference profile ID", model)
-    settings["bedrock_model_id"] = model
+    common.set_kimi_model(settings, model)
     if args.endpoint_url is not None:
         settings["bedrock_endpoint_url"] = args.endpoint_url or None
+    if getattr(args, "auth", None):
+        settings["aws_auth"] = AUTH_CHOICES[args.auth]
     return settings
 
 
@@ -474,6 +502,24 @@ def ensure_backend_usable(settings: dict[str, Any], args: argparse.Namespace) ->
             "(sudo apt install gnome-keyring libsecret-1-0) and make sure a D-Bus session is running; on a headless "
             "server re-run setup with --credential-backend file to use a 0600 file instead.")
     raise GatewayError(f"The system keyring backend '{name}' is not usable.", hint=hint, code="no_keyring")
+
+
+AUTH_CHOICES = {"bearer": "bearer", "access-key": "access_key"}
+
+
+def obtain_access_keys_interactively(args: argparse.Namespace, settings: dict[str, Any],
+                                     store: common.SecretStore) -> None:
+    existing = read_access_keys(store)
+    if existing and not args.replace_token:
+        ok(f"An AWS access key pair is already stored ({describe_access_keys(existing)}); keeping it.")
+        if interactive(args) and common.confirm("Replace the stored access key pair?", default=False):
+            update_access_keys(args, settings, store, confirm_replace=False)
+        return
+    if not existing and not interactive(args) and not args.token_stdin:
+        raise GatewayError("No AWS access key pair stored and no way to ask for one.",
+                           hint="Re-run interactively, or pass --token-stdin and pipe the key ID and secret "
+                                "in on two lines.", code="missing_token")
+    update_access_keys(args, settings, store, confirm_replace=False)
 
 
 def obtain_token_interactively(args: argparse.Namespace, settings: dict[str, Any], store: common.SecretStore) -> None:
@@ -521,7 +567,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         master = common.generate_master_key()
         store.set(common.SECRET_MASTER_KEY, master)
         ok(f"Generated a new local proxy master key (fingerprint {common.fingerprint(master)}).")
-    obtain_token_interactively(args, settings, store)
+    if settings["aws_auth"] == "access_key":
+        obtain_access_keys_interactively(args, settings, store)
+    else:
+        obtain_token_interactively(args, settings, store)
     token = get_secret(store, common.SECRET_BEDROCK_TOKEN)
     if token and token == master:
         raise GatewayError("The Bedrock token and the proxy master key must differ.", code="key_reuse")
@@ -681,6 +730,88 @@ def update_token(args: argparse.Namespace, settings: dict[str, Any], store: comm
     return True
 
 
+def update_access_keys(args: argparse.Namespace, settings: dict[str, Any], store: common.SecretStore,
+                       confirm_replace: bool = True) -> bool:
+    """Prompt for an IAM access key pair, validate it with a SigV4-signed request, then store it."""
+    key_id = common.read_secret("AWS access key ID")
+    if not common.ACCESS_KEY_ID_RE.match(key_id):
+        raise GatewayError("That is not an IAM user access key ID (AKIA followed by 16 letters/digits).",
+                           hint="Temporary credentials (ASIA..., which need a session token) are not supported.",
+                           code="invalid_input")
+    secret = common.read_secret("AWS secret access key")
+    if not common.SECRET_ACCESS_KEY_RE.match(secret):
+        raise GatewayError("That is not an AWS secret access key (40 characters of letters, digits, / + =).",
+                           code="invalid_input")
+    new = common.AwsKeys(key_id, secret)
+    existing = read_access_keys(store)
+    if existing == new:
+        ok("That access key pair is already the stored one; nothing changed.")
+        return False
+    if existing and confirm_replace and not getattr(args, "yes", False):
+        if not interactive(args):
+            raise GatewayError("An access key pair is already stored; pass --yes to replace it non-interactively.",
+                               code="confirmation_required")
+        if not common.confirm(f"Replace the stored access key pair ({describe_access_keys(existing)}) "
+                              f"with the new one ({describe_access_keys(new)})?", default=False):
+            info("Kept the existing access key pair.")
+            return False
+    if getattr(args, "no_validate", False):
+        warn("Saving without validation (--no-validate).")
+    else:
+        info(f"Validating the access key pair against {settings['bedrock_model_id']} in {settings['aws_region']} ...")
+        result = validate.probe_bedrock(settings, new)
+        if result.ok:
+            ok(result.message)
+        else:
+            fail(result.message)
+            if result.hint:
+                info("    " + result.hint)
+            if not getattr(args, "save_unvalidated", False):
+                info("The previously stored access key pair (if any) was left unchanged.")
+                raise GatewayError("The access key pair was not saved because validation failed.", code=result.code)
+            warn("Saving the access key pair although validation failed (explicitly requested).")
+    store.set(common.SECRET_AWS_ACCESS_KEY_ID, key_id)
+    store.set(common.SECRET_AWS_SECRET_ACCESS_KEY, secret)
+    ok(f"AWS access key pair saved to the {settings['credential_backend']} store ({describe_access_keys(new)}).")
+    return True
+
+
+def cmd_set_auth(args: argparse.Namespace) -> int:
+    settings, store = load()
+    common.require_valid(settings)
+    mode = AUTH_CHOICES[args.mode]
+    trial = dict(settings, aws_auth=mode)
+    changed_credential = False
+    if mode == "access_key":
+        if args.replace or not read_access_keys(store):
+            changed_credential = update_access_keys(args, trial, store, confirm_replace=True)
+        else:
+            ok(f"Using the stored AWS access key pair ({describe_access_keys(read_access_keys(store))}); "
+               "pass --replace to enter a new one.")
+        if not read_access_keys(store):
+            return 1
+    else:
+        if not get_secret(store, common.SECRET_BEDROCK_TOKEN):
+            changed_credential = update_token(args, trial, store, confirm_replace=False)
+            if not get_secret(store, common.SECRET_BEDROCK_TOKEN):
+                return 1
+        if args.forget_access_key:
+            removed = [store.delete(n) for n in (common.SECRET_AWS_ACCESS_KEY_ID, common.SECRET_AWS_SECRET_ACCESS_KEY)]
+            (ok if any(removed) else info)("Removed the stored AWS access key pair." if any(removed)
+                                           else "No AWS access key pair was stored.")
+    if settings["aws_auth"] == mode:
+        ok(f"Bedrock authentication is already '{args.mode}'.")
+        if changed_credential:
+            offer_restart(args, settings, store, "Bedrock credentials")
+        return 0
+    backup_settings("set-auth")
+    common.save_settings(trial, common.paths())
+    common.write_runtime_config(trial)
+    ok(f"Bedrock authentication set to '{args.mode}'.")
+    offer_restart(args, trial, store, "Bedrock authentication")
+    return 0
+
+
 def cmd_update_key(args: argparse.Namespace) -> int:
     settings, store = load()
     common.require_valid(settings)
@@ -704,6 +835,9 @@ def cmd_update_key(args: argparse.Namespace) -> int:
         ok("Restored the previous Bedrock token.")
         offer_restart(args, settings, store, "Bedrock token")
         return 0
+    if settings.get("aws_auth") == "access_key":
+        warn("The gateway currently authenticates with an AWS access key pair, so it does not use this token. "
+             "Switch with: gateway set-auth bearer")
     if update_token(args, settings, store, confirm_replace=True):
         offer_restart(args, settings, store, "Bedrock token")
     return 0
@@ -737,10 +871,10 @@ def cmd_set_region(args: argparse.Namespace) -> int:
             raise GatewayError("Region not changed.", hint=f"Re-run with --model-id {suggestion}.",
                                code="unsupported_model_or_region")
         model = suggestion
-    new["bedrock_model_id"] = model
+    common.set_kimi_model(new, model)
     common.require_valid(new)
     if not args.no_validate:
-        token = get_secret(store, common.SECRET_BEDROCK_TOKEN)
+        token = bedrock_credential(new, store)
         if token:
             result = validate.probe_bedrock(new, token)
             (ok if result.ok else fail)(result.message)
@@ -768,12 +902,17 @@ def enable_classifier(args: argparse.Namespace, settings: dict[str, Any], store:
     if backend == "bedrock":
         c["bedrock_model_id"] = getattr(args, "model_id", None) or c.get("bedrock_model_id") or \
             common.default_classifier_model_for_region(settings["aws_region"])
+        if getattr(args, "base_model", None):
+            c["base_model"] = args.base_model
         c["credential"] = "separate" if getattr(args, "separate_credential", False) else "shared"
+        for issue in common.validate_settings(settings):
+            if issue.level == "error" and "classifier" in issue.message.lower():
+                raise GatewayError(issue.message, hint=issue.hint, code="invalid_settings")
         if c["credential"] == "separate":
             value = common.read_secret("Bedrock API key for the classifier model")
             store.set(common.SECRET_CLASSIFIER_BEDROCK_TOKEN, value)
-        token = get_secret(store, common.SECRET_CLASSIFIER_BEDROCK_TOKEN if c["credential"] == "separate"
-                           else common.SECRET_BEDROCK_TOKEN)
+        token = (get_secret(store, common.SECRET_CLASSIFIER_BEDROCK_TOKEN) if c["credential"] == "separate"
+                 else bedrock_credential(settings, store))
         if token and not getattr(args, "no_validate", False):
             result = validate.probe_bedrock(settings, token, c["bedrock_model_id"], kind="claude")
             (ok if result.ok else fail)("Classifier model: " + result.message)
@@ -962,6 +1101,7 @@ def print_settings(settings: dict[str, Any]) -> None:
         ("Kimi API / effort", f"{settings['kimi_api']} / {settings['kimi_reasoning_effort']}"
                               f"{' / prompt cache' if settings.get('kimi_prompt_cache', True) else ''}"),
         ("Proxy", f"{settings['proxy_host']}:{settings['proxy_port']}"),
+        ("Bedrock auth", "access key (SigV4)" if settings.get("aws_auth") == "access_key" else "bearer token"),
         ("Credential store", settings["credential_backend"]),
         ("LiteLLM (configured)", settings["litellm_version"]),
         ("Auto-mode classifier", c["backend"] if c["backend"] == "none" else
@@ -1126,7 +1266,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             usable, name = common.SecretStore.keyring_usable()
             (ok if usable else fail)(f"Keyring backend: {name}")
             problems += not usable
-        for secret in (common.SECRET_BEDROCK_TOKEN, common.SECRET_MASTER_KEY):
+        primary = ((common.SECRET_AWS_ACCESS_KEY_ID, common.SECRET_AWS_SECRET_ACCESS_KEY)
+                   if settings.get("aws_auth") == "access_key" else (common.SECRET_BEDROCK_TOKEN,))
+        for secret in (*primary, common.SECRET_MASTER_KEY):
             value = get_secret(store, secret)
             (ok if value else fail)(f"{secret}: {'stored (fingerprint ' + common.fingerprint(value) + ')' if value else 'missing'}")
             problems += not value
@@ -1156,7 +1298,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             warn(f"{var} is set in this shell; the launcher overrides/unsets it for Claude Code.")
     if args.live:
         step("Live Bedrock check")
-        token = get_secret(store, common.SECRET_BEDROCK_TOKEN)
+        token = bedrock_credential(settings, store)
         if token:
             result = validate.probe_bedrock(settings, token)
             (ok if result.ok else fail)(result.message)
@@ -1298,10 +1440,13 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     install_requirements(staging, trial)
     py = str(common.venv_python(staging))
     step("Compatibility checks in the staging environment")
+    # LiteLLM cannot see the model behind an application-profile ARN; check the Kimi ID it would serve.
+    lookaround_model = "moonshotai.kimi-k3" if common.is_application_profile(settings["bedrock_model_id"]) \
+        else settings["bedrock_model_id"]
     check = subprocess.run([py, "-c", (
         "import json, litellm, importlib.metadata as m\n"
         "from litellm.llms.bedrock.common_utils import bedrock_model_supports_regex_lookaround as f\n"
-        f"print(json.dumps({{'version': m.version('litellm'), 'drops_lookaround': not f({settings['bedrock_model_id']!r})}}))")],
+        f"print(json.dumps({{'version': m.version('litellm'), 'drops_lookaround': not f({lookaround_model!r})}}))")],
         capture_output=True, text=True, timeout=300, check=False, env={**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"})
     if check.returncode != 0:
         fail("The staged LiteLLM lacks APIs the gateway relies on:")
@@ -1311,7 +1456,7 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     result = json.loads(check.stdout.strip().splitlines()[-1])
     (ok if result["drops_lookaround"] else fail)(
         f"LiteLLM {result['version']} {'drops' if result['drops_lookaround'] else 'does NOT drop'} look-around "
-        f"regexes from tool schemas for {settings['bedrock_model_id']}")
+        f"regexes from tool schemas for {lookaround_model}")
     subprocess.run([py, "-m", "pip", "install", "-q", "-r", str(common.REPO_ROOT / "requirements-dev.txt")],
                    check=False)
     tests = subprocess.run([py, "-m", "pytest", "-q", "-m", "not e2e and not live", str(common.REPO_ROOT / "tests")],
@@ -1432,7 +1577,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model-id")
     s.add_argument("--endpoint-url", help="override the Bedrock runtime endpoint (VPC endpoint or test mock)")
     s.add_argument("--credential-backend", choices=["keyring", "file"])
-    s.add_argument("--token-stdin", action="store_true", help="read the Bedrock token from stdin")
+    s.add_argument("--auth", choices=list(AUTH_CHOICES),
+                   help="authenticate with a Bedrock API key (bearer, default) or an IAM access key pair")
+    s.add_argument("--token-stdin", action="store_true",
+                   help="read the Bedrock token (or access key ID and secret, one per line) from stdin")
     s.add_argument("--replace-token", action="store_true")
     s.add_argument("--reset", action="store_true", help="reset settings to defaults (backup kept)")
     s.add_argument("--skip-live", action="store_true", help="skip the live Bedrock test")
@@ -1465,6 +1613,15 @@ def build_parser() -> argparse.ArgumentParser:
     uk.add_argument("--rollback", action="store_true", help="restore the previously stored token")
     uk.add_argument("--forget-previous", action="store_true")
 
+    sa = sub.add_parser("set-auth", help="choose Bedrock authentication: bearer token or IAM access key pair")
+    sa.add_argument("mode", choices=list(AUTH_CHOICES))
+    sa.add_argument("--replace", action="store_true", help="enter a new access key pair even if one is stored")
+    sa.add_argument("--forget-access-key", action="store_true", help="(bearer) delete the stored access key pair")
+    sa.add_argument("--yes", action="store_true", help="replace without confirmation")
+    sa.add_argument("--no-validate", action="store_true")
+    sa.add_argument("--save-unvalidated", action="store_true", help="save even if validation fails")
+    sa.add_argument("--restart", action="store_true", help="restart a running background proxy afterwards")
+
     rm = sub.add_parser("rotate-master-key", help="generate a new local proxy master key")
     rm.add_argument("--yes", action="store_true")
     rm.add_argument("--restart", action="store_true")
@@ -1479,7 +1636,9 @@ def build_parser() -> argparse.ArgumentParser:
     cl = sub.add_parser("classifier", help="auto-mode classifier route: status | enable | disable")
     cl.add_argument("action", choices=["status", "enable", "disable"])
     cl.add_argument("--backend", choices=["bedrock", "anthropic"], default="bedrock")
-    cl.add_argument("--model-id", help="Bedrock profile (bedrock) or model name (anthropic)")
+    cl.add_argument("--model-id", help="Bedrock profile or application-profile ARN (bedrock), or model name (anthropic)")
+    cl.add_argument("--base-model", help="for an application-profile ARN: the Claude model behind it "
+                                         "(default anthropic.claude-sonnet-5)")
     cl.add_argument("--separate-credential", action="store_true", help="use a separate Bedrock token")
     cl.add_argument("--replace-token", action="store_true")
     cl.add_argument("--no-validate", action="store_true")
@@ -1515,7 +1674,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "bootstrap": cmd_bootstrap, "setup": cmd_setup, "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
     "status": cmd_status, "health": cmd_health, "logs": cmd_logs, "version": cmd_version, "config": cmd_config,
-    "update-key": cmd_update_key, "rotate-master-key": cmd_rotate_master_key, "set-region": cmd_set_region,
+    "update-key": cmd_update_key, "set-auth": cmd_set_auth, "rotate-master-key": cmd_rotate_master_key, "set-region": cmd_set_region,
     "classifier": cmd_classifier, "launch-claude": cmd_launch_claude, "_claude-env": cmd_internal_claude_env,
     "doctor": cmd_doctor, "scan-secrets": cmd_scan_secrets, "upgrade": cmd_upgrade, "uninstall": cmd_uninstall,
 }

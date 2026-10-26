@@ -188,3 +188,43 @@ def test_probe_network_error(monkeypatch):
     monkeypatch.setattr(validate, "_http", boom)
     res = validate.probe_bedrock(common.default_settings(), "tok-xyz-123456")
     assert res.code == "network_error" and not res.ok
+
+
+@pytest.mark.parametrize("status,body,code", [
+    # Chat Completions reports IAM denials as 401: must not be blamed on the token.
+    (401, {"error": {"message": "User: arn:aws:iam::1:user/u is not authorized to perform: bedrock:InvokeModel "
+                                "on resource: x"}}, "model_access_denied"),
+    (403, {"Message": "User: arn:aws:iam::1:user/u is not authorized to perform: bedrock:CallWithBearerToken "
+                      "on resource: *"}, "bearer_token_not_allowed"),
+    (400, {"error": {"message": "Application inference profiles are not supported by this API."}}, "unsupported_api"),
+    (401, {"message": "Invalid API Key format"}, "invalid_token"),
+])
+def test_bedrock_error_classification(status, body, code):
+    result = validate.classify_bedrock_error(status, {}, json.dumps(body).encode(), "m", "ap-south-1")
+    assert result.code == code
+
+
+def test_sigv4_signature_matches_botocore():
+    pytest.importorskip("botocore")
+    import datetime as dt  # noqa: PLC0415
+
+    from botocore.auth import SigV4Auth  # noqa: PLC0415
+    from botocore.awsrequest import AWSRequest  # noqa: PLC0415
+    from botocore.credentials import Credentials  # noqa: PLC0415
+
+    keys = common.AwsKeys("AKIA" + "ABCDEFGHIJKLMNOP", "abcdefghijklmnopqrstuvwxyz" + "0123456789/+AB")  # kgw-scan: allow (fake test key)
+    url = ("https://bedrock-runtime.ap-south-1.amazonaws.com/model/"
+           "arn%3Aaws%3Abedrock%3Aap-south-1%3A123456789012%3Aapplication-inference-profile%2Fabc/converse")
+    body = b'{"messages": []}'
+    req = AWSRequest(method="POST", url=url, data=body)
+    SigV4Auth(Credentials(keys.access_key_id, keys.secret_access_key), "bedrock", "ap-south-1").add_auth(req)
+    stamp = req.headers["X-Amz-Date"]
+    now = dt.datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    ours = validate.sigv4_headers("POST", url, body, "ap-south-1", keys, now=now)
+    assert ours["Authorization"] == req.headers["Authorization"]
+
+
+def test_access_key_probe_errors_name_the_key_pair():
+    result = validate.classify_bedrock_error(403, {}, b'{"message":"The security token included in the request is invalid."}',
+                                             "m", "ap-south-1")
+    assert result.code == "invalid_token"  # bearer wording; probe_bedrock rewrites it for AwsKeys

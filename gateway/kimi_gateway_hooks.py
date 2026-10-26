@@ -232,6 +232,26 @@ def _strip_reasoning(messages: list[Any]) -> int:
     return removed
 
 
+def _strip_cache_control(data: dict[str, Any]) -> int:
+    """Remove Anthropic ``cache_control`` markers from system, messages and tools.
+
+    On Converse LiteLLM turns them into ``cachePoint`` blocks unless it recognises the model as
+    non-Claude. Behind an application-inference-profile ARN it cannot, and Kimi K3 rejects
+    cachePoint with a 400 (verified live, 2026-10-26).
+    """
+    removed = 0
+    blocks: list[Any] = list(data.get("tools") or [])
+    if isinstance(data.get("system"), list):
+        blocks += data["system"]
+    for msg in data.get("messages") or []:
+        if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+            blocks += msg["content"]
+    for block in blocks:
+        if isinstance(block, dict) and block.pop("cache_control", None) is not None:
+            removed += 1
+    return removed
+
+
 def _sanitize_schemas(data: dict[str, Any]) -> list[str]:
     changed: list[str] = []
     for tool in data.get("tools") or []:
@@ -298,6 +318,8 @@ def adapt_kimi_request(data: dict[str, Any]) -> dict[str, Any]:
         removed = _strip_reasoning(messages)
         if removed:
             log.debug("kimi adapter: removed %d prior reasoning block(s)", removed)
+    if os.environ.get("KGW_KIMI_API", "chat_completions") == "converse":
+        _strip_cache_control(data)
     changed = _sanitize_schemas(data)
     if changed:
         # Names only: never the schema contents.

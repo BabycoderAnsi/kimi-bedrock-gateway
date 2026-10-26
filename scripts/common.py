@@ -31,12 +31,30 @@ SECRET_BEDROCK_TOKEN = "bedrock-bearer-token"
 SECRET_MASTER_KEY = "litellm-master-key"
 SECRET_CLASSIFIER_BEDROCK_TOKEN = "classifier-bedrock-bearer-token"
 SECRET_CLASSIFIER_ANTHROPIC_KEY = "classifier-anthropic-api-key"
+# IAM user access key pair, used instead of the bearer token when aws_auth = "access_key".
+SECRET_AWS_ACCESS_KEY_ID = "aws-access-key-id"
+SECRET_AWS_SECRET_ACCESS_KEY = "aws-secret-access-key"
 ALL_SECRETS = (
     SECRET_BEDROCK_TOKEN,
     SECRET_MASTER_KEY,
     SECRET_CLASSIFIER_BEDROCK_TOKEN,
     SECRET_CLASSIFIER_ANTHROPIC_KEY,
+    SECRET_AWS_ACCESS_KEY_ID,
+    SECRET_AWS_SECRET_ACCESS_KEY,
 )
+AWS_AUTH_MODES = ("bearer", "access_key")
+ACCESS_KEY_ID_RE = re.compile(r"^AKIA[A-Z0-9]{16}$")  # long-term IAM user keys only (no session tokens)
+SECRET_ACCESS_KEY_RE = re.compile(r"^[A-Za-z0-9/+=]{40}$")
+
+
+@dataclass(frozen=True)
+class AwsKeys:
+    """An IAM access key pair; requests are SigV4-signed instead of using a bearer token."""
+    access_key_id: str
+    secret_access_key: str
+
+    def __repr__(self) -> str:  # never show the secret, even in tracebacks
+        return f"AwsKeys(access_key_id={self.access_key_id[:4]}..., secret_access_key=[REDACTED])"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SUPPORTED_PYTHON = ((3, 11), (3, 12), (3, 13), (3, 14))
@@ -76,10 +94,14 @@ _CLASSIFIER_GEO_BY_PREFIX = (
     (("ap-southeast-2", "ap-southeast-4"), "au.anthropic.claude-sonnet-5"),
 )
 KIMI_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")  # AWS model card; "minimal" is not supported
-CLASSIFIER_REQUEST_MODEL = "claude-sonnet-5"  # the model ID Claude Code 2.1.303 sends classifier calls to
+CLASSIFIER_REQUEST_MODEL = "claude-sonnet-5"
+DEFAULT_CLASSIFIER_BASE_MODEL = "anthropic.claude-sonnet-5"  # the model ID Claude Code 2.1.303 sends classifier calls to
 REGION_RE = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d$")
 ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$")
+# Application inference profiles (created by an admin, often the only thing an IAM policy allows).
+# Bedrock's Chat Completions API rejects them, so they force kimi_api=converse.
+APP_PROFILE_RE = re.compile(r"^arn:aws[a-z-]*:bedrock:([a-z0-9-]+):\d{12}:application-inference-profile/[A-Za-z0-9]+$")
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "schema_version": SETTINGS_SCHEMA_VERSION,
@@ -100,10 +122,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "allow_non_loopback": False,
     "litellm_version": PINNED_LITELLM,
     "credential_backend": "keyring",  # keyring | file
+    # How the gateway authenticates to Bedrock: "bearer" (Amazon Bedrock API key) or "access_key"
+    # (IAM access key ID + secret access key, SigV4-signed; no bedrock:CallWithBearerToken needed).
+    "aws_auth": "bearer",
     "bedrock_endpoint_url": None,  # optional override (VPC endpoint, or the offline test mock)
     "classifier": {
         "backend": "none",  # none | bedrock | anthropic
-        "bedrock_model_id": None,  # default derived from the region
+        "bedrock_model_id": None,  # default derived from the region; may be an application-profile ARN
+        # Only for an application-profile ARN: the Claude model behind it (LiteLLM can't see through the ARN).
+        "base_model": None,  # default anthropic.claude-sonnet-5
         "anthropic_model": "claude-sonnet-5",
         "request_model": CLASSIFIER_REQUEST_MODEL,
         "credential": "shared",  # shared (reuse the Bedrock token) | separate
@@ -327,6 +354,20 @@ def suggest_kimi_profile(region: str) -> str | None:
     return "global.moonshotai.kimi-k3" if region in _GLOBAL_SOURCES else None
 
 
+def is_application_profile(model: Any) -> bool:
+    return isinstance(model, str) and APP_PROFILE_RE.match(model) is not None
+
+
+def set_kimi_model(s: dict[str, Any], model: str) -> None:
+    """Store the Kimi model/profile ID and pick the Bedrock API it needs."""
+    was_app_profile = is_application_profile(s.get("bedrock_model_id"))
+    s["bedrock_model_id"] = model
+    if is_application_profile(model):
+        s["kimi_api"] = "converse"
+    elif was_app_profile:
+        s["kimi_api"] = "chat_completions"
+
+
 def validate_settings(s: dict[str, Any]) -> list[Issue]:
     issues: list[Issue] = []
     region = s.get("aws_region")
@@ -340,6 +381,14 @@ def validate_settings(s: dict[str, Any]) -> list[Issue]:
                             "Use a Region code such as ap-south-1."))
     if not isinstance(model, str) or not MODEL_ID_RE.match(model):
         issues.append(Issue("error", f"bedrock_model_id {model!r} is not a valid Bedrock model or profile ID."))
+    elif is_application_profile(model):
+        profile_region = APP_PROFILE_RE.match(model).group(1)
+        if profile_region != region:
+            issues.append(Issue("error", f"Application inference profile is in {profile_region} but aws_region is {region}.",
+                                f"Set aws_region to {profile_region}."))
+        if s.get("kimi_api") != "converse":
+            issues.append(Issue("error", "Bedrock's Chat Completions API does not accept application inference profiles.",
+                                'Set "kimi_api": "converse" (setup and set-region do this automatically for an ARN).'))
     elif isinstance(region, str):
         allowed = KNOWN_KIMI_PROFILES.get(model)
         if model == "moonshotai.kimi-k3":
@@ -382,6 +431,8 @@ def validate_settings(s: dict[str, Any]) -> list[Issue]:
                                        "only takes effect with kimi_api=chat_completions."))
     if not isinstance(s.get("kimi_prompt_cache"), bool):
         issues.append(Issue("error", "kimi_prompt_cache must be true or false."))
+    if s.get("aws_auth") not in AWS_AUTH_MODES:
+        issues.append(Issue("error", "aws_auth must be 'bearer' or 'access_key'."))
     if s.get("credential_backend") not in ("keyring", "file"):
         issues.append(Issue("error", "credential_backend must be 'keyring' or 'file'."))
     endpoint = s.get("bedrock_endpoint_url")
@@ -405,7 +456,19 @@ def validate_settings(s: dict[str, Any]) -> list[Issue]:
         issues.append(Issue("error", "classifier.request_model must differ from model_alias."))
     if backend == "bedrock":
         cmodel = c.get("bedrock_model_id") or default_classifier_model_for_region(region or "")
-        if "anthropic.claude" not in cmodel:
+        if is_application_profile(cmodel):
+            base = c.get("base_model") or DEFAULT_CLASSIFIER_BASE_MODEL
+            if APP_PROFILE_RE.match(cmodel).group(1) != region:
+                issues.append(Issue("error", f"The classifier's application inference profile is not in {region}.",
+                                    "Use a classifier profile created in the same Region as the gateway."))
+            if not isinstance(base, str) or "anthropic.claude" not in base:
+                issues.append(Issue("error", f"classifier.base_model {base!r} is not a Claude model. Set it to the "
+                                             "Claude model the classifier profile points at (for example "
+                                             f"{DEFAULT_CLASSIFIER_BASE_MODEL}); Kimi K3 is not a classifier."))
+            if cmodel == s.get("bedrock_model_id"):
+                issues.append(Issue("error", "The classifier profile is the same ARN as the Kimi model. Auto mode "
+                                             "needs a separate Claude profile."))
+        elif "anthropic.claude" not in cmodel:
             issues.append(Issue("error", f"classifier.bedrock_model_id {cmodel} is not a Claude model. "
                                          "Auto mode requires a supported Claude classifier; Kimi K3 is not one."))
     if backend == "anthropic" and "claude" not in str(c.get("anthropic_model", "")):
@@ -443,17 +506,28 @@ def render_runtime_config(s: dict[str, Any], template_path: Path | None = None) 
     c = s["classifier"]
     endpoint = s.get("bedrock_endpoint_url")
     endpoint_line = f"\n      aws_bedrock_runtime_endpoint: {json.dumps(endpoint)}" if endpoint else ""
+    if s.get("aws_auth") == "access_key":
+        auth_lines = ("aws_access_key_id: os.environ/KGW_AWS_ACCESS_KEY_ID\n"
+                      "      aws_secret_access_key: os.environ/KGW_AWS_SECRET_ACCESS_KEY")
+    else:
+        auth_lines = "api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK"
     classifier_block = ""
     if c["backend"] == "bedrock":
         model = c.get("bedrock_model_id") or default_classifier_model_for_region(s["aws_region"])
-        env = "KGW_CLASSIFIER_BEDROCK_TOKEN" if c["credential"] == "separate" else "AWS_BEARER_TOKEN_BEDROCK"
+        classifier_auth = ("api_key: os.environ/KGW_CLASSIFIER_BEDROCK_TOKEN" if c["credential"] == "separate"
+                           else auth_lines)
+        model_line = f"      model: {json.dumps('bedrock/' + model)}\n"
+        if is_application_profile(model):
+            # LiteLLM formats the request for base_model and sends it to the ARN (model_id).
+            model_line = (f"      model: {json.dumps('bedrock/' + (c.get('base_model') or DEFAULT_CLASSIFIER_BASE_MODEL))}\n"
+                          f"      model_id: {json.dumps(model)}\n")
         classifier_block = (
             f"  # Auto-mode classifier: a real Claude model, reachable only by classifier-shaped requests.\n"
             f"  - model_name: {json.dumps(c['request_model'])}\n"
             f"    litellm_params:\n"
-            f"      model: {json.dumps('bedrock/' + model)}\n"
+            f"{model_line}"
             f"      aws_region_name: {json.dumps(s['aws_region'])}\n"
-            f"      api_key: os.environ/{env}{endpoint_line}\n"
+            f"      {classifier_auth}{endpoint_line}\n"
         )
     elif c["backend"] == "anthropic":
         classifier_block = (
@@ -467,6 +541,7 @@ def render_runtime_config(s: dict[str, Any], template_path: Path | None = None) 
         "__MODEL_ALIAS__": json.dumps(s["model_alias"]),
         "__BEDROCK_MODEL__": json.dumps(f"bedrock/{s.get('kimi_api', 'chat_completions')}/{s['bedrock_model_id']}"),
         "__AWS_REGION__": json.dumps(s["aws_region"]),
+        "__AUTH_LINES__": auth_lines,
         "__ENDPOINT_LINE__": endpoint_line,
         "__CLASSIFIER_BLOCK__": classifier_block,
     }

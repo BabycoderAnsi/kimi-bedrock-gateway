@@ -33,12 +33,19 @@ import json
 import os
 import re
 import struct
+import hashlib
+import hmac
 import threading
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 VALID_TOKEN = "mock-valid-token"
+# SigV4 test credentials (not real AWS keys): the mock verifies signatures made with them.
+VALID_ACCESS_KEY_ID = "AKIA" + "MOCKMOCKMOCK0001"  # kgw-scan: allow (fake test key)
+VALID_SECRET_ACCESS_KEY = "mockSecretAccessKey/" + "0123456789+abcdefghi"
+SIGV4_RE = re.compile(r"AWS4-HMAC-SHA256 Credential=(?P<key>[^/]+)/(?P<date>\d{8})/(?P<region>[^/]+)/"
+                      r"(?P<service>[^/]+)/aws4_request, ?SignedHeaders=(?P<signed>[^,]+), ?Signature=(?P<sig>[0-9a-f]+)")
 LOOKAROUND = re.compile(r"\(\?<?[=!]")
 _lock = threading.Lock()
 
@@ -100,13 +107,33 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # keep test output quiet
         pass
 
-    def _record(self, model: str, op: str, body):
+    def _sigv4_valid(self, raw: bytes) -> bool:
+        """Recompute the SigV4 signature from the request as received (any signer: ours or botocore)."""
+        m = SIGV4_RE.match(self.headers.get("authorization", ""))
+        if not m or m["key"] != VALID_ACCESS_KEY_ID:
+            return False
+        path, _, query = self.path.partition("?")
+        canonical_headers = "".join(f"{h}:{' '.join((self.headers.get(h) or '').split())}\n"
+                                    for h in m["signed"].split(";"))
+        canonical = "\n".join([self.command, quote(path, safe="/-_.~"),
+                               "&".join(sorted(query.split("&"))) if query else "",
+                               canonical_headers, m["signed"], hashlib.sha256(raw).hexdigest()])
+        stamp = self.headers.get("x-amz-date", "")
+        scope = f"{m['date']}/{m['region']}/{m['service']}/aws4_request"
+        to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+        key = ("AWS4" + VALID_SECRET_ACCESS_KEY).encode()
+        for part in (m["date"], m["region"], m["service"], "aws4_request"):
+            key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+        return hmac.compare_digest(hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest(), m["sig"])
+
+    def _record(self, model: str, op: str, body, raw: bytes = b""):
         auth = self.headers.get("authorization", "")
+        sigv4 = auth.startswith("AWS4-HMAC-SHA256 ")
         entry = {
             "model": model,
             "op": op,
             "auth": "bearer" if auth.lower().startswith("bearer ") else ("sigv4" if auth else "none"),
-            "token_valid": auth == f"Bearer {VALID_TOKEN}",
+            "token_valid": auth == f"Bearer {VALID_TOKEN}" or (sigv4 and self._sigv4_valid(raw)),
             "body": body,
         }
         with _lock, open(os.path.join(self.log_dir, "requests.jsonl"), "a") as fh:
@@ -139,7 +166,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
         except ValueError:
             return self._error(400, "ValidationException", "malformed JSON")
-        entry = self._record(model, op, body)
+        entry = self._record(model, op, body, raw)
 
         if not entry["token_valid"]:
             return self._error(403, "AccessDeniedException",
@@ -150,7 +177,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(403, "AccessDeniedException",
                                "You don't have access to the model with the specified model ID.")
 
-        is_kimi = "moonshotai.kimi" in model
+        # Application inference profiles in the tests always point at Kimi K3.
+        is_kimi = "moonshotai.kimi" in model or (":application-inference-profile/" in model
+                                                 and "claude" not in model.lower())
         if is_kimi:
             for schema in _schemas_in(body):
                 for pattern in _iter_patterns(schema or {}):
@@ -204,9 +233,12 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._openai_error(400, "invalid_request_error", "malformed JSON", "validation_error")
         model = str(body.get("model", ""))
-        entry = self._record(model, "chat-completions", body)
+        entry = self._record(model, "chat-completions", body, raw)
         if not entry["token_valid"]:
             return self._openai_error(401, "authentication_error", "Invalid API key.", "invalid_api_key")
+        if ":application-inference-profile/" in model:  # as Bedrock answers
+            return self._openai_error(400, "invalid_request_error",
+                                      "Application inference profiles are not supported by this API.", "validation_error")
         if "moonshotai.kimi" in model:
             for tool in body.get("tools") or []:
                 for pattern in _iter_patterns((tool.get("function") or {}).get("parameters") or {}):
