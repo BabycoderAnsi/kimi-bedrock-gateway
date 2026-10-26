@@ -100,6 +100,32 @@ That's all. If the gateway isn't running, `claude-kimi` starts it in the backgro
 one that's already starting. Anything after the command goes to Claude Code, for example
 `./claude-kimi.sh -p "explain this repo"` or `./claude-kimi.sh --resume`.
 
+**Use it from any project, not just this repo.** The launcher finds the gateway's files from its own
+location and doesn't change folders. Claude Code opens in **the folder you run it from**, with that
+folder's permissions, `CLAUDE.md` and project settings, just like plain `claude`:
+
+```bash
+cd ~/code/my-project
+~/Desktop/kimi-bedrock-gateway/claude-kimi.sh --permission-mode auto
+```
+
+To shorten that, add a shell alias once (zsh shown; use `~/.bashrc` for bash). Replace the path with
+wherever you cloned this repo:
+
+```bash
+echo "alias claude-kimi='$HOME/Desktop/kimi-bedrock-gateway/claude-kimi.sh'" >> ~/.zshrc
+source ~/.zshrc
+
+cd ~/code/my-project
+claude-kimi                           # or: claude-kimi --permission-mode auto
+```
+
+Use an alias, not a symlink in `~/.local/bin`. The script looks for its helper files next to its own
+path, so a symlinked copy can't find them. On Windows, call
+`& "$HOME\Desktop\kimi-bedrock-gateway\claude-kimi.ps1"` from your project folder, or add a function
+to your PowerShell profile:
+`function claude-kimi { & "$HOME\Desktop\kimi-bedrock-gateway\claude-kimi.ps1" @args }`.
+
 To skip even that, enable autostart once (§3, "Start automatically at login"):
 
 ```bash
