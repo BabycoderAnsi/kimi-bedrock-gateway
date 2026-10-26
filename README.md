@@ -143,6 +143,11 @@ To skip even that, enable autostart once (§3, "Start automatically at login"):
 
 Add `--restart` to apply it to a running gateway.
 
+**Shift+Tab doesn't offer "auto"?** That's expected until you choose a reviewer. With none configured,
+the launcher prints "Auto mode is DISABLED for this session" and starts Claude Code with Auto Mode
+removed from the Shift+Tab cycle. Enable a reviewer, then quit and relaunch Claude Code; see
+"Using Auto Mode with the opt-in" in §7.
+
 ### Step 6: check and fix
 
 ```bash
@@ -679,8 +684,41 @@ If you can't get a Claude classifier, you can let Kimi K3 answer Claude Code's A
 
 ```bash
 ./gateway.sh classifier enable --backend kimi --accept-risk --restart
-./gateway.sh classifier disable          # undo
+./gateway.sh classifier disable --restart   # undo
 ```
+
+#### Using Auto Mode with the opt-in
+
+1. Quit Claude Code if it's running (`/exit`, or Ctrl+C twice). The launcher decides Auto Mode
+   availability once per launch, so an open session doesn't pick up the change.
+2. From the gateway folder, enable the opt-in:
+   ```bash
+   cd ~/Desktop/kimi-bedrock-gateway
+   ./gateway.sh classifier enable --backend kimi --accept-risk --restart
+   ```
+   It prints a warning, then
+   `Auto-mode classifier route enabled: 'claude-sonnet-5' -> Kimi K3 … [UNSAFE opt-in: self-review]`.
+3. Launch from your project:
+   ```bash
+   cd ~/code/my-project
+   claude-kimi                              # or: claude-kimi --permission-mode auto
+   ```
+   Before Claude Code opens, the launcher prints
+   `Auto mode is available, but its reviewer is Kimi K3 itself (UNSAFE opt-in …)`.
+4. Shift+Tab now cycles through the modes, including **auto**. `--permission-mode auto` starts in it
+   directly.
+
+**If the launcher still says "Auto mode is DISABLED for this session"**, check the line just above it:
+
+| Launcher says | Fix |
+|---|---|
+| `Classifier route check failed: …` | The gateway couldn't reach Kimi for the safety check. Run `./gateway.sh doctor --live`, fix what it reports, then `./gateway.sh restart` |
+| `… the running gateway does not serve it; restart the gateway` | The gateway is still running the old config: `./gateway.sh restart`, then relaunch |
+| `no supported Claude classifier is configured` | The opt-in isn't saved. `./gateway.sh classifier status` should say `Kimi K3 reviewing its own actions (UNSAFE opt-in)`; if not, rerun step 2 |
+
+Not every command gets a review. Claude Code approves read-only commands (`echo`, `ls`) and edits
+inside the project folder by itself, so Kimi only judges the rest. Each review is logged in
+`./gateway.sh logs` as `classifier request served by Kimi K3`.
 
 **Understand what this means first.** The model that proposes a command also approves it, so this is
 **not an independent safety check**. A prompt injection (in a file, web page, issue or tool output) that
@@ -757,6 +795,7 @@ Run `./gateway.sh doctor --live` first. Errors are classified as follows:
 | `claude_missing` | Claude Code not installed | see §1 |
 | `claude_broken`: *placeholder* / *Exec format error* on `…/.nvm/…/bin/claude` | npm installed Claude Code but skipped its install step (`ignore-scripts`, `--omit=optional`), leaving a text placeholder instead of the native binary | `curl -fsSL https://claude.ai/install.sh \| bash`, then `npm uninstall -g @anthropic-ai/claude-code`; check that `claude --version` works |
 | Claude Code shows *401*, or *400 No connected db* | Claude Code is using a different key (LiteLLM looks up unknown `sk-…` keys in a database it doesn't have, hence the odd message) | always launch with `claude-kimi`; check `ANTHROPIC_API_KEY` isn't forced elsewhere |
+| Shift+Tab never shows **auto**; launcher says *Auto mode is DISABLED for this session* | no Auto Mode reviewer is configured, or the running gateway predates it | enable one (`classifier enable …`, see §7), then `./gateway.sh restart` and relaunch Claude Code |
 | *auto mode cannot determine the safety …* / `kgw_classifier_refused` in logs | classifier unreachable, so the gateway kept it off Kimi | `./gateway.sh classifier status`; fix model access, or use Manual mode |
 
 **A proxy that started doesn't prove the model works.** `status` and `health` show liveness and
