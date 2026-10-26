@@ -95,7 +95,8 @@ _CLASSIFIER_GEO_BY_PREFIX = (
 )
 KIMI_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")  # AWS model card; "minimal" is not supported
 CLASSIFIER_REQUEST_MODEL = "claude-sonnet-5"
-DEFAULT_CLASSIFIER_BASE_MODEL = "anthropic.claude-sonnet-5"  # the model ID Claude Code 2.1.303 sends classifier calls to
+DEFAULT_CLASSIFIER_BASE_MODEL = "anthropic.claude-sonnet-5"
+CLASSIFIER_BACKENDS = ("none", "bedrock", "anthropic", "kimi")  # the model ID Claude Code 2.1.303 sends classifier calls to
 REGION_RE = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d$")
 ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$")
@@ -117,6 +118,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Explicit Bedrock prompt-cache breakpoints for Kimi K3 on Chat Completions (cache reads bill
     # ~10x cheaper than input; writes 1.25x). Only effective with kimi_api=chat_completions.
     "kimi_prompt_cache": True,
+    # claude-kimi starts the gateway in the background when it isn't running (no separate start step).
+    "start_gateway_on_launch": True,
     "proxy_host": "127.0.0.1",
     "proxy_port": 4000,
     "allow_non_loopback": False,
@@ -134,6 +137,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "anthropic_model": "claude-sonnet-5",
         "request_model": CLASSIFIER_REQUEST_MODEL,
         "credential": "shared",  # shared (reuse the Bedrock token) | separate
+        # backend "kimi" (Kimi K3 reviews its own auto-mode actions) is refused unless this is true.
+        "accept_kimi_self_review": False,
     },
     "claude": {
         "disable_structured_outputs": False,
@@ -155,16 +160,32 @@ class GatewayError(Exception):
 # --------------------------------------------------------------------------- paths
 
 
-def state_dir() -> Path:
-    """Private per-user directory for settings, runtime config, PID file and logs."""
-    override = os.environ.get("KGW_HOME")
-    if override:
-        return Path(override).expanduser()
+def default_state_dir() -> Path:
     if os.name == "nt":
         base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return Path(base) / APP_NAME
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / APP_NAME
+
+
+def state_dir() -> Path:
+    """Private per-user directory for settings, runtime config, PID file and logs."""
+    override = os.environ.get("KGW_HOME")
+    return Path(override).expanduser() if override else default_state_dir()
+
+
+def instance_suffix(root: Path | None = None) -> str:
+    """'' for the default install; a short stable hash for any other KGW_HOME (keeps instances apart)."""
+    root = (root or state_dir()).expanduser().resolve()
+    if root == default_state_dir().expanduser().resolve():
+        return ""
+    return hashlib.sha256(str(root).encode()).hexdigest()[:10]
+
+
+def keyring_service(p: Paths | None = None) -> str:
+    # A second install (KGW_HOME) must never read or overwrite the default install's credentials.
+    suffix = instance_suffix((p or paths()).root)
+    return f"{KEYRING_SERVICE}@{suffix}" if suffix else KEYRING_SERVICE
 
 
 @dataclass(frozen=True)
@@ -186,6 +207,10 @@ class Paths:
     @property
     def pid_file(self) -> Path:
         return self.root / "run" / "proxy.pid"
+
+    @property
+    def start_lock(self) -> Path:
+        return self.root / "run" / "start.lock"
 
     @property
     def log_dir(self) -> Path:
@@ -433,6 +458,8 @@ def validate_settings(s: dict[str, Any]) -> list[Issue]:
         issues.append(Issue("error", "kimi_prompt_cache must be true or false."))
     if s.get("aws_auth") not in AWS_AUTH_MODES:
         issues.append(Issue("error", "aws_auth must be 'bearer' or 'access_key'."))
+    if not isinstance(s.get("start_gateway_on_launch"), bool):
+        issues.append(Issue("error", "start_gateway_on_launch must be true or false."))
     if s.get("credential_backend") not in ("keyring", "file"):
         issues.append(Issue("error", "credential_backend must be 'keyring' or 'file'."))
     endpoint = s.get("bedrock_endpoint_url")
@@ -444,8 +471,16 @@ def validate_settings(s: dict[str, Any]) -> list[Issue]:
 
     c = s.get("classifier") or {}
     backend = c.get("backend")
-    if backend not in ("none", "bedrock", "anthropic"):
-        issues.append(Issue("error", "classifier.backend must be none, bedrock or anthropic."))
+    if backend not in CLASSIFIER_BACKENDS:
+        issues.append(Issue("error", "classifier.backend must be none, bedrock, anthropic or kimi."))
+    if backend == "kimi":
+        if c.get("accept_kimi_self_review") is not True:
+            issues.append(Issue("error", "classifier.backend 'kimi' makes Kimi K3 approve its own auto-mode actions; "
+                                         "it requires classifier.accept_kimi_self_review = true.",
+                                "Use: gateway classifier enable --backend kimi --accept-risk"))
+        else:
+            issues.append(Issue("warning", "Auto mode uses Kimi K3 to review its own actions (unsafe opt-in): a "
+                                           "prompt injection that steers Kimi can also get its actions approved."))
     if c.get("credential") not in ("shared", "separate"):
         issues.append(Issue("error", "classifier.credential must be 'shared' or 'separate'."))
     req = c.get("request_model")
@@ -529,6 +564,16 @@ def render_runtime_config(s: dict[str, Any], template_path: Path | None = None) 
             f"      aws_region_name: {json.dumps(s['aws_region'])}\n"
             f"      {classifier_auth}{endpoint_line}\n"
         )
+    elif c["backend"] == "kimi":
+        classifier_block = (
+            f"  # UNSAFE opt-in: Claude Code's auto-mode classifier served by Kimi K3 itself, so Kimi reviews its\n"
+            f"  # own actions. Still reachable only by classifier-shaped requests.\n"
+            f"  - model_name: {json.dumps(c['request_model'])}\n"
+            f"    litellm_params:\n"
+            f"      model: {json.dumps(f'bedrock/{s.get('kimi_api', 'chat_completions')}/{s['bedrock_model_id']}')}\n"
+            f"      aws_region_name: {json.dumps(s['aws_region'])}\n"
+            f"      {auth_lines}{endpoint_line}\n"
+        )
     elif c["backend"] == "anthropic":
         classifier_block = (
             f"  # Auto-mode classifier: a real Claude model, reachable only by classifier-shaped requests.\n"
@@ -573,6 +618,7 @@ class SecretStore:
             raise GatewayError(f"Unknown credential backend {backend!r}.")
         self.backend = backend
         self.p = p or paths()
+        self.service = keyring_service(self.p)
 
     # keyring helpers ---------------------------------------------------------
     @staticmethod
@@ -605,12 +651,12 @@ class SecretStore:
     def _kr_get(self, name: str) -> str | None:
         kr = self._keyring()
         try:
-            head = kr.get_password(KEYRING_SERVICE, name)
+            head = kr.get_password(self.service, name)
             if head is None:
                 return None
             if head.startswith("kgw-chunked:"):
                 count = int(head.split(":", 1)[1])
-                parts = [kr.get_password(KEYRING_SERVICE, f"{name}.part{i}") for i in range(count)]
+                parts = [kr.get_password(self.service, f"{name}.part{i}") for i in range(count)]
                 if any(part is None for part in parts):
                     raise GatewayError(f"Stored credential '{name}' is incomplete.",
                                        hint="Update it again with the update-bedrock-key command.")
@@ -631,10 +677,10 @@ class SecretStore:
             if len(value) > _KEYRING_CHUNK:
                 parts = [value[i:i + _KEYRING_CHUNK] for i in range(0, len(value), _KEYRING_CHUNK)]
                 for i, part in enumerate(parts):
-                    kr.set_password(KEYRING_SERVICE, f"{name}.part{i}", part)
-                kr.set_password(KEYRING_SERVICE, name, f"kgw-chunked:{len(parts)}")
+                    kr.set_password(self.service, f"{name}.part{i}", part)
+                kr.set_password(self.service, name, f"kgw-chunked:{len(parts)}")
             else:
-                kr.set_password(KEYRING_SERVICE, name, value)
+                kr.set_password(self.service, name, value)
         except Exception as exc:  # noqa: BLE001
             raise GatewayError(f"Could not save '{name}' to the system credential store "
                                f"({exc.__class__.__name__}).", code="keyring_error") from None
@@ -643,17 +689,17 @@ class SecretStore:
         kr = self._keyring()
         removed = False
         try:
-            head = kr.get_password(KEYRING_SERVICE, name)
+            head = kr.get_password(self.service, name)
         except Exception:  # noqa: BLE001
             head = None
         if head is not None and head.startswith("kgw-chunked:"):
             for i in range(int(head.split(":", 1)[1])):
                 try:
-                    kr.delete_password(KEYRING_SERVICE, f"{name}.part{i}")
+                    kr.delete_password(self.service, f"{name}.part{i}")
                 except Exception:  # noqa: BLE001
                     pass
         try:
-            kr.delete_password(KEYRING_SERVICE, name)
+            kr.delete_password(self.service, name)
             removed = True
         except Exception:  # noqa: BLE001 - PasswordDeleteError when absent
             pass

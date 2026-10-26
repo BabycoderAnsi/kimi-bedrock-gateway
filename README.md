@@ -4,22 +4,33 @@ Use **Kimi K3 on Amazon Bedrock** as the model behind **Claude Code**, through a
 **LiteLLM** proxy, on Windows 10/11, Ubuntu and Apple Silicon macOS.
 
 ```
-Claude Code ──(Anthropic Messages, ANTHROPIC_BASE_URL)──► LiteLLM proxy on 127.0.0.1:4000 ──(Chat Completions, bearer token)──► Bedrock: in.moonshotai.kimi-k3
-   process-scoped env from the launcher                    + kimi_gateway_hooks adapter                                   (ap-south-1 → Mumbai/Hyderabad)
-                                                            └─ optional classifier route ─(Invoke)─► Bedrock: in.anthropic.claude-sonnet-5
+Claude Code ──(Anthropic Messages, ANTHROPIC_BASE_URL)──► LiteLLM proxy on 127.0.0.1:4000 ──(bearer token or SigV4)──► Bedrock: Kimi K3
+   process-scoped env from the launcher                    + kimi_gateway_hooks adapter                              in.moonshotai.kimi-k3, global./us. profile,
+                                                                                                                      or an admin's application-profile ARN
+                                                            └─ optional classifier route ──────────────────────────► Bedrock Claude (profile or ARN), Anthropic API,
+                                                                                                                      or (unsafe opt-in) Kimi K3 itself
 ```
 
 * `kimi-k3` is the coding model for every Claude Code request: main loop, subagents, and the
   background/Haiku/Opus slots.
 * Claude Code authenticates to the proxy with a randomly generated local **master key**. The proxy
-  authenticates to Bedrock with your **Bedrock API key** (`AWS_BEARER_TOKEN_BEDROCK`). Both are kept
-  in the OS credential store, and neither is ever written to a file in this repository.
-* Auto Mode needs a real Claude classifier. Kimi K3 is never used as one (see [Auto Mode](#7-auto-mode)).
+  authenticates to Bedrock with either a **Bedrock API key** (bearer token) or an **IAM access key
+  pair** (SigV4). All credentials are kept in the OS credential store, and none is ever written to a
+  file in this repository.
+* Kimi K3 can be reached through a standard inference profile or through an **application inference
+  profile ARN** that an admin created.
+* Setup is one-time. Afterwards `claude-kimi` starts the gateway on demand, and the gateway (and
+  optionally Claude Code) can also **start automatically at login**.
+* Auto Mode is designed around an independent Claude classifier. Without one it's disabled. Kimi K3
+  can review its own actions only through an explicit, **unsafe opt-in** (see [Auto Mode](#7-auto-mode)).
+
+**New here? Start with the [Quick start](#quick-start).**
 
 ---
 
 ## Contents
 
+0. [Quick start](#quick-start): set up, daily use, command cheat sheet, settings reference
 1. [Prerequisites](#1-prerequisites)
 2. [Install (one command)](#2-install-one-command)
 3. [Start and stop the proxy](#3-start-and-stop-the-proxy)
@@ -36,6 +47,129 @@ Claude Code ──(Anthropic Messages, ANTHROPIC_BASE_URL)──► LiteLLM prox
 14. [Repository layout and development](#14-repository-layout-and-development)
 
 ---
+
+## Quick start
+
+### Step 1: install the prerequisites
+
+You need Python 3.11–3.14 and Claude Code ≥ 2.1.288. You don't need admin rights. See
+[§1](#1-prerequisites) for details.
+
+### Step 2: decide how the gateway authenticates to Bedrock
+
+| You have | Use | Your IAM user needs |
+|---|---|---|
+| A **Bedrock API key** (`ABSK…` or `bedrock-api-key-…`) | `--auth bearer` (default) | `bedrock:InvokeModel*` on the Kimi profile and model, **and** `bedrock:CallWithBearerToken` |
+| An **IAM access key ID + secret** (`AKIA…`) | `--auth access-key` | `bedrock:InvokeModel*` on the Kimi profile and model |
+
+Then decide which Kimi K3 model ID to use:
+
+| Your IAM policy allows | Model ID to pass |
+|---|---|
+| Standard inference profiles | nothing: the default is `in.moonshotai.kimi-k3` (or `us.`/`global.`, see §6) |
+| Only an **application inference profile** (the resource ends in `:application-inference-profile/<id>`) | `--model-id arn:aws:bedrock:<region>:<account>:application-inference-profile/<id>` |
+
+If you're not sure, ask your AWS admin for the IAM policy on your user. If Bedrock refuses a model,
+`./gateway.sh doctor --live` explains why.
+
+### Step 3: run setup once
+
+```bash
+# macOS / Ubuntu. Windows: .\setup.ps1 with the same options.
+
+# Bedrock API key, default India profile:
+./setup.sh
+
+# IAM access keys + an admin's application inference profile, starting at every login:
+./setup.sh --auth access-key \
+  --model-id arn:aws:bedrock:ap-south-1:<account>:application-inference-profile/<id> \
+  --autostart --open-claude-at-login
+```
+
+Setup asks for the credential with input hidden, checks it with one tiny request to Bedrock, and
+stores it in the OS credential store. It then renders the LiteLLM config and runs a short live test
+through the gateway. Re-running setup is safe and keeps what already works.
+
+### Step 4: use it every day
+
+```bash
+./claude-kimi.sh          # Windows: .\claude-kimi.ps1
+```
+
+That's all. If the gateway isn't running, `claude-kimi` starts it in the background, or waits for
+one that's already starting. Anything after the command goes to Claude Code, for example
+`./claude-kimi.sh -p "explain this repo"` or `./claude-kimi.sh --resume`.
+
+To skip even that, enable autostart once (§3, "Start automatically at login"):
+
+```bash
+./gateway.sh autostart enable                                   # gateway at login
+./gateway.sh autostart enable --open-claude --claude-workdir ~/code/my-project   # + Claude Code in a terminal
+```
+
+### Step 5 (optional): choose an Auto Mode reviewer
+
+| Option | Command | Safety |
+|---|---|---|
+| None (default) | nothing | Auto Mode is disabled; use Manual, Accept edits or `/sandbox` |
+| **Claude classifier** (recommended) | `./gateway.sh classifier enable` (Bedrock Sonnet 5), `--model-id <Claude profile or ARN>`, or `--backend anthropic` | independent reviewer, as Claude Code intends |
+| Kimi K3 reviews itself | `./gateway.sh classifier enable --backend kimi --accept-risk` | **unsafe**: no independent check; see §7 |
+
+Add `--restart` to apply it to a running gateway.
+
+### Step 6: check and fix
+
+```bash
+./gateway.sh doctor --live     # full diagnosis plus one real Bedrock request
+./gateway.sh status            # running? healthy? which model, auth and reviewer? autostart?
+./gateway.sh logs              # recent gateway log, secrets redacted
+```
+
+[§8](#8-troubleshooting-authentication-and-model-access) maps every error code to a fix.
+
+### Command cheat sheet
+
+On Windows, use the `.ps1` version of each script (`.\gateway.ps1 <command>`).
+
+| Task | Command |
+|---|---|
+| Start / stop / restart the gateway | `./start.sh [--background]`, `./gateway.sh stop`, `./gateway.sh restart` |
+| Launch Claude Code through the gateway | `./claude-kimi.sh [claude args…]` |
+| Start at login (± Claude Code) | `./gateway.sh autostart enable [--open-claude] [--claude-workdir DIR]` / `disable` / `status` |
+| Replace the Bedrock API key | `./update-bedrock-key.sh [--restart]` (`--rollback` restores the previous one) |
+| Switch to / replace IAM access keys | `./gateway.sh set-auth access-key [--replace] [--restart]` |
+| Switch back to the API key | `./gateway.sh set-auth bearer [--forget-access-key]` |
+| Change Region or model / profile ARN | `./gateway.sh set-region <region> [--model-id <id or ARN>]` |
+| Auto Mode reviewer | `./gateway.sh classifier enable [...]` / `disable` / `status` |
+| Rotate the local master key | `./gateway.sh rotate-master-key` |
+| Show or validate settings | `./gateway.sh config show` / `config validate` |
+| Scan the repo for leaked secrets | `./gateway.sh scan-secrets` |
+| Upgrade LiteLLM safely | `./gateway.sh upgrade [--rollback]` |
+| Remove everything | `./uninstall.sh [--remove-venv --remove-config --remove-credentials]` |
+
+### Settings reference
+
+Everything persists in `settings.json`; see "Where things are stored" in §2. Prefer the commands
+above, which validate before saving. If you edit the file by hand, run `./gateway.sh config validate`,
+then `./gateway.sh restart`.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `aws_region` | `ap-south-1` | Bedrock Region the gateway calls |
+| `bedrock_model_id` | `in.moonshotai.kimi-k3` | Kimi K3 profile ID, or an application-profile ARN |
+| `kimi_api` | `chat_completions` | Bedrock API for Kimi; set to `converse` automatically for an ARN |
+| `kimi_reasoning_effort` | `low` | `none`…`max`, or `client` (Chat Completions only) |
+| `kimi_prompt_cache` | `true` | explicit Bedrock cache markers (Chat Completions only) |
+| `aws_auth` | `bearer` | `bearer` (Bedrock API key) or `access_key` (IAM key pair, SigV4) |
+| `credential_backend` | `keyring` | `keyring` (OS store) or `file` (0600 `secrets.json`) |
+| `start_gateway_on_launch` | `true` | `claude-kimi` starts the gateway when it isn't running |
+| `model_alias` | `kimi-k3` | model name Claude Code uses for Kimi |
+| `proxy_host` / `proxy_port` | `127.0.0.1` / `4000` | where the gateway listens |
+| `classifier.backend` | `none` | `none`, `bedrock`, `anthropic`, or `kimi` (unsafe opt-in) |
+| `classifier.bedrock_model_id` | per Region | Claude profile ID or application-profile ARN |
+| `classifier.base_model` | `anthropic.claude-sonnet-5` | for a classifier ARN: the Claude model behind it |
+| `classifier.accept_kimi_self_review` | `false` | must be `true` for `classifier.backend = kimi` |
+| `bedrock_endpoint_url` | `null` | VPC endpoint override |
 
 ## 1. Prerequisites
 
@@ -55,11 +189,13 @@ Claude Code ──(Anthropic Messages, ANTHROPIC_BASE_URL)──► LiteLLM prox
 
 **AWS:**
 
-* A Bedrock API key, created in the console under *Amazon Bedrock → API keys*. Long-term keys
-  start with `ABSK…`; short-term keys start with `bedrock-api-key-…` and expire within 12 hours.
-* The key's IAM identity must be allowed to call `bedrock:InvokeModel` and
-  `bedrock:InvokeModelWithResponseStream` on the inference profile, and on the foundation model in
-  each destination Region.
+* **Either** a Bedrock API key, created in the console under *Amazon Bedrock → API keys* (long-term
+  keys start with `ABSK…`; short-term keys start with `bedrock-api-key-…` and expire within 12
+  hours), **or** an IAM user access key pair (`AKIA…` plus a secret; see §5).
+* The IAM identity must be allowed to call `bedrock:InvokeModel` and
+  `bedrock:InvokeModelWithResponseStream` on the inference profile (or application profile ARN), and
+  on the foundation model in each destination Region. A Bedrock API key additionally needs
+  `bedrock:CallWithBearerToken`.
 
 Default Region and model: **`ap-south-1`** with **`in.moonshotai.kimi-k3`**. This is the India
 geographic inference profile, which routes only between Mumbai and Hyderabad. Kimi K3 has no
@@ -167,6 +303,52 @@ is the gateway:
 
 Background mode keeps the master key and Bedrock token only in the proxy process's environment.
 They aren't on its command line and aren't in the log.
+
+### Start automatically at login
+
+Settings and credentials already persist (`settings.json` and the OS credential store), so setup is a
+one-time step. To avoid starting the gateway by hand:
+
+```bash
+./gateway.sh autostart enable                      # gateway starts at every login
+./gateway.sh autostart enable --open-claude        # ...and Claude Code (Kimi K3) opens in a terminal
+./gateway.sh autostart enable --open-claude --claude-workdir ~/code/my-project
+./gateway.sh autostart status
+./gateway.sh autostart disable                     # removes the login items; uninstall does too
+# or during setup: ./setup.sh --autostart [--open-claude-at-login]
+```
+
+Separately, `claude-kimi` **starts the gateway in the background whenever it isn't running**. If one
+is already starting, for example from the login item, it waits for that one instead. So even without
+autostart there's no separate start step. To get the old "ask first" behaviour, set
+`"start_gateway_on_launch": false`.
+
+| Platform | Login item (per user, no admin rights) |
+|---|---|
+| macOS | `~/Library/LaunchAgents/com.kimi-bedrock-gateway.plist` runs `manage.py start --background` at login, in the GUI session where the Keychain is unlocked. With `--open-claude`, `com.kimi-bedrock-gateway.claude.plist` opens Terminal on a generated `claude-kimi.command`. |
+| Ubuntu | XDG autostart entries in `~/.config/autostart/`, which run inside the desktop session after GNOME Keyring unlocks. The Claude entry uses `Terminal=true`. |
+| Windows | `.cmd` files in the user's Startup folder. The gateway runs via `pythonw` with no console; Claude Code opens with `powershell -NoExit -ExecutionPolicy Bypass -File claude-kimi.ps1`, a per-process flag that leaves the machine's execution policy unchanged. |
+
+Notes:
+- **Stopping:** the login item only starts the gateway; it doesn't restart it. After `gateway stop` it
+  stays stopped until the next login, or the next `claude-kimi`.
+- **Headless servers:** XDG autostart needs a desktop login, so it doesn't run on a server with no
+  graphical session. Use `start.sh --background` from your own service manager instead.
+- **Separate installs:** a non-default `KGW_HOME` gets its own login-item label and its own credential
+  store name (`kimi-bedrock-gateway@<hash>`). A second install never reads, overwrites or deletes
+  the default install's credentials or login items.
+
+Verified live on macOS (2026-10-26) with a scratch install. Its login item was written to a scratch
+folder and loaded into launchd under its own label:
+- launchd started the gateway, and it read the access key pair from the Keychain without a prompt.
+- In a simulated login, the gateway item and the Claude Code `.command` started at the same moment.
+  The launcher waited for the starting gateway, only one gateway ran, and Claude Code (2.1.310) answered
+  19 s after "login". Most of that time was gateway startup.
+- `uninstall` unloaded the item and deleted the files and Keychain entries.
+
+Not exercised: the Terminal window opened by the Claude Code login item (its `.command` was run
+directly instead), a real reboot, and the Ubuntu and Windows login items. The Ubuntu and Windows
+items are only covered by offline tests of the generated files.
 
 ## 4. Launch Claude Code through the gateway
 
@@ -414,6 +596,8 @@ displays:
   (`--backend anthropic`). Setup checks that the account can actually invoke it. Each launch sends a
   classifier-shaped probe through the gateway, and Auto Mode stays disabled for that session if the
   probe fails.
+* **Unsafe opt-in** (`./gateway.sh classifier enable --backend kimi --accept-risk`): Kimi K3 serves
+  the classifier slot itself. See "Opt-in: Kimi K3 reviews its own actions" below.
 * **Defense in depth, enforced in the gateway** (`gateway/kimi_gateway_hooks.py`):
   * any classifier-shaped request addressed to `kimi-k3` is **refused with 403**, so Claude Code
     blocks the action: it fails closed and nothing runs unreviewed;
@@ -463,6 +647,41 @@ classifier were each behind their own ARN, and every request was SigV4-signed wi
 The harmless command was approved, and every classifier call went to the Claude ARN, none to Kimi.
 **Not yet verified against real Bedrock**, because the account this was built for had no Claude access.
 
+### Opt-in: Kimi K3 reviews its own actions (unsafe)
+
+If you can't get a Claude classifier, you can let Kimi K3 answer Claude Code's Auto Mode safety checks:
+
+```bash
+./gateway.sh classifier enable --backend kimi --accept-risk --restart
+./gateway.sh classifier disable          # undo
+```
+
+**Understand what this means first.** The model that proposes a command also approves it, so this is
+**not an independent safety check**. A prompt injection (in a file, web page, issue or tool output) that
+steers Kimi into a dangerous command can steer its approval too. Claude Code's Auto Mode is designed
+around a separate Claude classifier, and Kimi K3 is not on Claude Code's list of supported classifiers.
+Prefer a Claude classifier, Manual or Accept-edits mode, or `/sandbox`.
+
+How it works, compared with what a plain LiteLLM setup does by accident:
+- **A plain setup** has no `claude-sonnet-5` route. Every safety check fails first, and Claude Code then
+  silently retries it on the session model, Kimi. That means two requests per check, plus error noise.
+- **This opt-in** renders an explicit `claude-sonnet-5` route that is served by your Kimi model. Each check
+  is one call, and the route still accepts *only* classifier-shaped requests.
+- The `kimi-k3` coding route keeps refusing safety checks, and the launcher's Sonnet setting stays on
+  the classifier route.
+- The gateway removes the `</block>` stop sequence, because Kimi K3 rejects stop sequences ("This model
+  doesn't support the stopSequences field", verified live). Claude Code still parses the verdict.
+- It needs `--accept-risk`, or an explicit "yes" at an interactive prompt. Every launch prints a warning,
+  and `status`, `doctor` and `config validate` show it as **UNSAFE**.
+
+Verified live on 2026-10-26 with Claude Code 2.1.310 in `--permission-mode auto`, through an
+application-profile ARN with access-key auth:
+- **Harmless command:** a `python3 -c` command that writes and reads a scratch file went to Kimi for
+  review. It was approved and ran.
+- **Gateway log:** no "Invalid model name" and no stop-sequence errors.
+- **Not tested:** a case where Kimi *should* block a command, deliberately, because that would mean
+  asking for a genuinely risky command. The offline tests cover allow and block verdicts.
+
 ### Test results (offline, real Claude Code binary, mocked Bedrock: `tests/test_e2e_mock.py`)
 
 | Scenario | Outcome |
@@ -471,6 +690,9 @@ The harmless command was approved, and every classifier call went to the Claude 
 | Classifier on Sonnet 5 (mock verdict `<block>no</block>`) | Classifier evaluated on `in.anthropic.claude-sonnet-5` (stages `xml_s1`), command **ran** |
 | Classifier blocks (mock verdict `<block>yes</block>…`) | Both stages evaluated; Claude Code logged `Auto mode classifier blocked action: [Irreversible Local Destruction]…`; command **denied** |
 | Classifier model unavailable after launch (404) | Claude Code fell back to `kimi-k3`; gateway **refused**; action denied (fail closed); Kimi received **0** classifier prompts |
+| Kimi and classifier each behind an application-profile ARN, SigV4 auth | every classifier call went to the Claude ARN, every request was signed and verified; command **ran** |
+| Opt-in `--backend kimi` | every check went to the Kimi model through the `claude-sonnet-5` route, with no stop sequences and no failed first attempt; command **ran** |
+| Opt-in without `--accept-risk` | refused; settings unchanged |
 
 Not every command reaches the classifier. Read-only commands (`echo`, `ls`) and edits or removals
 inside the working directory are auto-allowed by Claude Code itself, as documented. Use a command
@@ -611,25 +833,38 @@ or anything else.
   PATH or global environment edits. Windows ACLs are set only on the gateway's own files.
 * **Background mode** keeps credentials in the memory of a long-lived process owned by you. Prefer
   foreground mode on shared machines, and stop the gateway when you're done.
-* **Auto Mode** classification never runs on Kimi K3 (§7). Without a Claude classifier, Auto Mode is
-  disabled rather than weakened.
+* **Auto Mode** classification never runs on Kimi K3 unless you explicitly opt in with
+  `classifier enable --backend kimi --accept-risk` (§7), and every launch then warns about it.
+  Without a classifier, Auto Mode is disabled rather than weakened.
+* **Access keys** (`set-auth access-key`) are long-lived and broader than a Bedrock API key. Keep the
+  IAM user limited to `bedrock:InvokeModel*` on the Kimi (and classifier) profiles, and rotate the keys.
+* **Login items** are per user (LaunchAgent, XDG autostart, Startup folder). They contain no secrets
+  and are removed by `autostart disable` and `uninstall`.
 
 ## 13. Supported versions, test status and known limitations
 
 | Component | Version |
 |---|---|
 | LiteLLM | **1.106.0** (stable; 1.105.1 is affected by the regex issue) |
-| Claude Code | **2.1.303** tested; ≥ 2.1.288 required |
+| Claude Code | **2.1.303** and **2.1.310** tested; ≥ 2.1.288 required |
 | Python | 3.11 – 3.14 supported; **tested on 3.14.7** |
 | keyring / psutil / prisma | 25.7.0 / 7.2.2 / 0.15.0 |
-| Bedrock model | `in.moonshotai.kimi-k3` (also `us.`/`global.`); auth by Bedrock API key (bearer token) |
+| Bedrock model | `in.moonshotai.kimi-k3` (also `us.`/`global.`), or an application-profile ARN; auth by Bedrock API key (bearer) or IAM access key pair (SigV4) |
 
 **What has actually been tested**
 
-* ✅ **macOS 27 on Apple Silicon (arm64)**, Python 3.14.7. Covered: 107 unit tests, 11 offline
-  end-to-end tests (real LiteLLM proxy, real Claude Code 2.1.303, mocked Bedrock that reproduces Kimi
-  K3's documented failures), `shellcheck` (clean), and PowerShell 7.6 parser checks on every `.ps1`.
-  The live Bedrock result is reported separately in the project notes when it has been run.
+* ✅ **macOS 27 on Apple Silicon (arm64)**, Python 3.14.7.
+  * **Automated:** 164 tests: 146 unit tests and 18 offline end-to-end tests. The end-to-end tests
+    use a real LiteLLM proxy, real Claude Code and a mocked Bedrock that reproduces Kimi K3's
+    documented failures and verifies SigV4 signatures. In the latest run 163 passed and 1 was skipped:
+    the PowerShell parser check, because `pwsh` wasn't installed (it passed with PowerShell 7.6 in an
+    earlier run). `shellcheck` is clean.
+  * **Live against real Bedrock** (2026-10-26):
+    * Kimi K3 through an application-profile ARN, with SigV4 access-key auth.
+    * Claude Code 2.1.310 for chat, a Bash tool call and Auto Mode with the Kimi self-review opt-in.
+    * A macOS login agent starting the gateway, including the race with the Claude Code login item.
+  * **Earlier:** Chat Completions with low effort and prompt caching on `in.`/`global.moonshotai.kimi-k3`
+    (§6).
 * ⚠️ **Ubuntu: not tested on a real Ubuntu machine.** The scripts are POSIX/bash and pass
   shellcheck, and the Linux keyring path uses `keyring` with Secret Service. Expect to need
   `python3-venv`, and a keyring or `--credential-backend file` on headless hosts.
@@ -672,6 +907,7 @@ scripts/validate.py            Bedrock / proxy / Claude Code probes and error cl
 scripts/manage.py              the CLI every wrapper calls
 scripts/lib.{sh,ps1}           wrapper helpers (Python discovery, venv lookup)
 scripts/claude-code-env.ps1    dot-source to configure the current PowerShell session
+scripts/autostart.py           login items: LaunchAgent (macOS), XDG autostart (Linux), Startup folder (Windows)
 gateway/kimi_gateway_hooks.py  LiteLLM pre-call hook: Kimi adapter + classifier guard
 tests/                         unit, offline e2e (mock_bedrock.py), opt-in live tests
 ```

@@ -227,3 +227,16 @@ def test_classifier_cannot_reuse_the_kimi_arn():
     common.set_kimi_model(s, APP_ARN)
     s["classifier"].update(backend="bedrock", bedrock_model_id=APP_ARN)
     assert any("same ARN as the Kimi model" in i.message for i in common.validate_settings(s) if i.level == "error")
+
+
+def test_kimi_self_review_needs_explicit_acceptance():
+    s = common.default_settings()
+    s["classifier"]["backend"] = "kimi"
+    assert any("accept_kimi_self_review" in i.message for i in common.validate_settings(s) if i.level == "error")
+    s["classifier"]["accept_kimi_self_review"] = True
+    issues = common.validate_settings(s)
+    assert not [i for i in issues if i.level == "error"]
+    assert any("review its own actions" in i.message for i in issues if i.level == "warning")
+    route = yaml.safe_load(common.render_runtime_config(s))["model_list"][1]
+    assert route["model_name"] == "claude-sonnet-5"
+    assert route["litellm_params"]["model"] == "bedrock/chat_completions/in.moonshotai.kimi-k3"

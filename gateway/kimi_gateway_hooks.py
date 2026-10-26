@@ -125,6 +125,11 @@ def _classifier_alias() -> str | None:
     return os.environ.get("KGW_CLASSIFIER_ALIAS") or None
 
 
+def _classifier_on_kimi() -> bool:
+    """The unsafe opt-in (classifier.backend = "kimi"): Kimi K3 reviews its own auto-mode actions."""
+    return os.environ.get("KGW_CLASSIFIER_BACKEND") == "kimi"
+
+
 # ------------------------------------------------------------------ detection
 
 
@@ -312,6 +317,10 @@ def apply_reasoning_effort(data: dict[str, Any], effort: str | None = None) -> s
 
 
 def adapt_kimi_request(data: dict[str, Any]) -> dict[str, Any]:
+    # Kimi K3 rejects stop sequences ("This model doesn't support the stopSequences field", verified
+    # live on Converse 2026-10-26); Claude Code's classifier sends ["</block>"] and parses the verdict anyway.
+    data.pop("stop_sequences", None)
+    data.pop("stop", None)
     apply_reasoning_effort(data)
     messages = data.get("messages")
     if isinstance(messages, list):
@@ -453,12 +462,17 @@ class KimiGatewayHooks(CustomLogger):
                             "(manage.py classifier enable) or use a non-auto permission mode."),
                 )
             return adapt_kimi_request(data)
-        if classifier and model == classifier and not is_classifier_request(data):
-            raise HTTPException(
-                status_code=403,
-                detail=(f"kgw_classifier_only: the '{classifier}' route serves Claude Code auto-mode classifier "
-                        f"requests only. Use '{primary}' for coding requests."),
-            )
+        if classifier and model == classifier:
+            if not is_classifier_request(data):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(f"kgw_classifier_only: the '{classifier}' route serves Claude Code auto-mode classifier "
+                            f"requests only. Use '{primary}' for coding requests."),
+                )
+            if _classifier_on_kimi():
+                log.warning("auto-mode classifier request served by Kimi K3 (unsafe opt-in: Kimi reviews its "
+                            "own actions)")
+                return adapt_kimi_request(data)
         return data
 
 

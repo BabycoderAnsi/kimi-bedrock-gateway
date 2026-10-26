@@ -302,6 +302,48 @@ def test_auto_mode_with_application_profiles_and_access_keys(tmp_path):
 
 
 @needs_claude
+def test_launcher_starts_a_stopped_gateway(gateway, tmp_path):
+    """No separate start step: claude-kimi brings the gateway up in the background on demand."""
+    gateway.manage("stop")
+    assert "not running" in gateway.manage("status", check=False)
+    result = _claude(gateway, tmp_path)
+    assert result["result"] == "mock reply from in.moonshotai.kimi-k3" and not result["is_error"]
+    assert "running, PID" in gateway.manage("status", check=False)
+
+
+def test_kimi_self_review_requires_consent(gateway):
+    out = gateway.manage("classifier", "enable", "--backend", "kimi", check=False)
+    assert "without explicit consent" in out
+    assert json.loads((gateway.home / "settings.json").read_text())["classifier"]["backend"] == "none"
+
+
+@needs_claude
+def test_auto_mode_with_kimi_self_review_opt_in(tmp_path):
+    """Opt-in: Claude Code's classifier slot is served by Kimi (one call per check, no failing Claude route)."""
+    if not VENV_PY.exists():
+        pytest.skip("project venv not installed")
+    arn = "arn:aws:bedrock:ap-south-1:123456789012:application-inference-profile/kimi0001"
+    gw = Gateway(tmp_path, ["--kimi-tool-cmd", 'python3 -c "print(6*7)"', "--classifier-mode", "allow"],
+                 extra_settings={"bedrock_model_id": arn, "kimi_api": "converse"})
+    try:
+        out = gw.manage("classifier", "enable", "--backend", "kimi", "--accept-risk", "--restart")
+        assert "UNSAFE" in out
+        proc = subprocess.run([str(VENV_PY), str(ROOT / "scripts" / "manage.py"), "launch-claude", "--", "-p",
+                               "run the probe", "--output-format", "json", "--permission-mode", "auto"],
+                              env={**gw.env, "CLAUDE_CONFIG_DIR": str(gw.tmp / "claude-config")}, cwd=tmp_path,
+                              capture_output=True, text=True, timeout=300)
+        assert "reviewer is Kimi K3 itself" in proc.stdout + proc.stderr
+        result = json.loads([line for line in proc.stdout.splitlines() if line.startswith("{")][-1])
+        assert result["permission_denials"] == [], result
+        checks = [r for r in gw.mock_requests() if "security monitor" in json.dumps(r["body"])]
+        assert checks and all(r["model"] == arn for r in checks)
+        assert all("stopSequences" not in json.dumps(r["body"].get("inferenceConfig", {})) for r in checks)
+        assert "Invalid model name" not in (gw.home / "logs" / "proxy.log").read_text()
+    finally:
+        gw.close()
+
+
+@needs_claude
 def test_auto_mode_classifier_block_is_enforced(tmp_path):
     gw = _auto_gateway(tmp_path, "block-rm", "python3 -c \"print('rm -rf simulated')\"")
     try:

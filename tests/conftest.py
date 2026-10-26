@@ -37,6 +37,16 @@ class MemoryKeyring:
         del self.data[(service, name)]
 
 
+@pytest.fixture(autouse=True)
+def isolated_login_items(tmp_path_factory, monkeypatch):
+    """Never write real login items or call launchctl from tests (subprocesses inherit this)."""
+    base = tmp_path_factory.mktemp("login-items")
+    for var in ("KGW_LAUNCH_AGENTS_DIR", "KGW_XDG_AUTOSTART_DIR", "KGW_STARTUP_DIR"):
+        monkeypatch.setenv(var, str(base))
+    monkeypatch.setenv("KGW_AUTOSTART_NO_LOAD", "1")
+    return base
+
+
 @pytest.fixture
 def kgw_home(tmp_path, monkeypatch):
     home = tmp_path / "kgw-home"

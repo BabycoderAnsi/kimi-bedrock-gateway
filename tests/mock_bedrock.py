@@ -191,6 +191,9 @@ class Handler(BaseHTTPRequestHandler):
             blob = json.dumps(body)
             if '"cachePoint"' in blob:
                 return self._error(400, "ValidationException", "This model doesn't support the cachePoint field")
+            if (body.get("inferenceConfig") or {}).get("stopSequences"):  # as real Kimi K3 answers (2026-10-26)
+                return self._error(400, "ValidationException", "This model doesn't support the stopSequences "
+                                                               "field. Remove stopSequences and try again.")
             for msg in (body.get("messages") or [])[:-1]:
                 if msg.get("role") == "assistant" and any(
                         isinstance(c, dict) and "reasoningContent" in c for c in msg.get("content") or []):
@@ -198,24 +201,32 @@ class Handler(BaseHTTPRequestHandler):
                                        "The server encountered an internal error while processing the request.")
 
         text = f"mock reply from {model}"
+        verdict = self._classifier_verdict(body)
+        if verdict is not None and not isinstance(verdict, str):
+            return verdict  # an error response
         if op in ("converse", "converse-stream"):
+            if verdict is not None:
+                return self._converse(op, verdict)
             msgs = body.get("messages") or []
             last = msgs[-1].get("content", []) if msgs else []
             carries_result = any(isinstance(c, dict) and "toolResult" in c for c in last)
             if is_kimi and self.kimi_tool_cmd and body.get("toolConfig") and not carries_result:
                 return self._converse_tool(op, self.kimi_tool_cmd)
             return self._converse(op, text)
+        return self._invoke(op, model, verdict if verdict is not None else text)
+
+    def _classifier_verdict(self, body):
+        """Answer Claude Code's auto-mode classifier prompt (whichever model the gateway sent it to)."""
         blob = json.dumps(body)
-        if "security monitor for autonomous AI coding agents" in blob:
-            if self.classifier_mode == "404":
-                return self._error(404, "ResourceNotFoundException", "Model not found (mock).")
-            transcript = json.dumps((body.get("messages") or [{}])[-1])
-            if self.classifier_mode == "block-rm" and "rm -rf" in transcript:
-                text = ("<block>yes</block><category>Irreversible Local Destruction</category>"
-                        "<reason>[Irreversible Local Destruction] mock classifier blocked rm -rf</reason>")
-            else:
-                text = "<block>no</block>"
-        return self._invoke(op, model, text)
+        if "security monitor for autonomous AI coding agents" not in blob:
+            return None
+        if self.classifier_mode == "404":
+            return self._error(404, "ResourceNotFoundException", "Model not found (mock).") or False
+        transcript = json.dumps((body.get("messages") or [{}])[-1])
+        if self.classifier_mode == "block-rm" and "rm -rf" in transcript:
+            return ("<block>yes</block><category>Irreversible Local Destruction</category>"
+                    "<reason>[Irreversible Local Destruction] mock classifier blocked rm -rf</reason>")
+        return "<block>no</block>"
 
     # ------------------------------------------------- OpenAI-compatible Chat Completions
     def _openai_error(self, status: int, err_type: str, message: str, code: str):
@@ -256,10 +267,13 @@ class Handler(BaseHTTPRequestHandler):
         # means this turn answers with text, so Claude Code's loop always terminates.
         already_called = any(m.get("role") == "tool" or (m.get("role") == "assistant" and m.get("tool_calls"))
                              for m in msgs)
-        tool_turn = bool(self.kimi_tool_cmd and body.get("tools") and not already_called)
+        verdict = self._classifier_verdict(body)
+        if verdict is not None and not isinstance(verdict, str):
+            return verdict
+        tool_turn = bool(self.kimi_tool_cmd and body.get("tools") and not already_called and verdict is None)
         effort = body.get("reasoning_effort")
         reasoning = "" if effort == "none" else f"(mock reasoning at effort {effort})"
-        text = f"mock reply from {model}"
+        text = verdict if verdict is not None else f"mock reply from {model}"
         usage = {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
         call = {"id": "call_mock1", "type": "function",
                 "function": {"name": "Bash", "arguments": json.dumps({"command": self.kimi_tool_cmd or "",

@@ -35,3 +35,6 @@ htmlcov/
 Thumbs.db
 .idea/
 .vscode/
+
+# Archives (may contain copies of other installs, including secrets)
+*.zip

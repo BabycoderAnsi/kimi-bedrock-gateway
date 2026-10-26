@@ -286,3 +286,23 @@ def test_stable_cache_key_ignores_session_and_follows_prefix(monkeypatch):
     changed[0]["content"][1]["text"] = "OTHER SYSTEM"
     c = call({**base, "messages": changed})
     assert c["prompt_cache_key"] != a["prompt_cache_key"]
+
+
+def test_kimi_self_review_opt_in_adapts_classifier_route_only(monkeypatch):
+    monkeypatch.setenv("KGW_CLASSIFIER_BACKEND", "kimi")
+    out = run(copy.deepcopy(CLASSIFIER))
+    assert out["model"] == "claude-sonnet-5" and "stop_sequences" not in out  # Kimi rejects stopSequences
+    data = copy.deepcopy(CODING)
+    data["model"] = "claude-sonnet-5"
+    with pytest.raises(hooks.HTTPException) as exc:  # still classifier-only
+        run(data)
+    assert "kgw_classifier_only" in exc.value.detail
+    data = copy.deepcopy(CLASSIFIER)
+    data["model"] = "kimi-k3"
+    with pytest.raises(hooks.HTTPException):  # the coding route still refuses classifier calls
+        run(data)
+
+
+def test_claude_classifier_route_keeps_stop_sequences(monkeypatch):
+    monkeypatch.delenv("KGW_CLASSIFIER_BACKEND", raising=False)
+    assert run(copy.deepcopy(CLASSIFIER))["stop_sequences"] == ["</block>"]

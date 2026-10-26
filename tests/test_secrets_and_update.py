@@ -70,7 +70,7 @@ def test_keyring_chunks_long_tokens(kgw_home, monkeypatch):
     long_token = "bedrock-api-key-" + "Z" * 3000
     store.set(common.SECRET_BEDROCK_TOKEN, long_token)
     assert store.get(common.SECRET_BEDROCK_TOKEN) == long_token
-    assert kr.data[(common.KEYRING_SERVICE, common.SECRET_BEDROCK_TOKEN)].startswith("kgw-chunked:")
+    assert kr.data[(common.keyring_service(), common.SECRET_BEDROCK_TOKEN)].startswith("kgw-chunked:")
     store.set(common.SECRET_BEDROCK_TOKEN, "short-token-1")  # replacing removes old parts
     assert not any(".part" in name for (_, name) in kr.data)
     assert store.delete(common.SECRET_BEDROCK_TOKEN)

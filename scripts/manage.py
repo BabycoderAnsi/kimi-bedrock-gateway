@@ -25,6 +25,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import common  # noqa: E402
+import autostart  # noqa: E402
 import validate  # noqa: E402
 from common import GatewayError  # noqa: E402
 
@@ -254,6 +255,7 @@ def build_proxy_env(settings: dict[str, Any], store: common.SecretStore) -> dict
         raise GatewayError("No local proxy master key is stored.", hint="Run setup.", code="missing_master_key")
     env = dict(os.environ)
     for k in ("DATABASE_URL", "LITELLM_MASTER_KEY", "AWS_BEARER_TOKEN_BEDROCK", "KGW_CLASSIFIER_ALIAS",
+              "KGW_CLASSIFIER_BACKEND",
               "STORE_MODEL_IN_DB", "KGW_AWS_ACCESS_KEY_ID", "KGW_AWS_SECRET_ACCESS_KEY"):
         env.pop(k, None)
     if isinstance(cred, common.AwsKeys):
@@ -277,6 +279,7 @@ def build_proxy_env(settings: dict[str, Any], store: common.SecretStore) -> dict
     c = settings["classifier"]
     if c["backend"] != "none":
         env["KGW_CLASSIFIER_ALIAS"] = c["request_model"]
+        env["KGW_CLASSIFIER_BACKEND"] = c["backend"]
         if c["backend"] == "bedrock" and c["credential"] == "separate":
             sep = get_secret(store, common.SECRET_CLASSIFIER_BEDROCK_TOKEN)
             if not sep:
@@ -320,7 +323,59 @@ def _litellm_cmd(settings: dict[str, Any]) -> list[str]:
             "--port", str(settings["proxy_port"])]
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        import psutil  # noqa: PLC0415
+        return psutil.pid_exists(pid)
+    except ImportError:
+        return True  # can't tell; rely on the age check
+
+
+def acquire_start_lock(p: common.Paths, wait: float = STARTUP_TIMEOUT + 15) -> None:
+    """Serialise gateway starts (login autostart and a launcher can race at login)."""
+    lock = p.start_lock
+    common.ensure_private_dir(lock.parent)
+    deadline = time.time() + wait
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return
+        except FileExistsError:
+            try:
+                holder = int(lock.read_text().strip() or 0)
+                stale = (time.time() - lock.stat().st_mtime > STARTUP_TIMEOUT + 30) or not _pid_alive(holder)
+            except (OSError, ValueError):
+                stale = True
+            if stale:
+                lock.unlink(missing_ok=True)
+                continue
+            if time.time() > deadline:
+                raise GatewayError("Another gateway start is still in progress.", hint="Check: gateway status",
+                                   code="start_in_progress") from None
+            time.sleep(0.5)
+
+
+def release_start_lock(p: common.Paths) -> None:
+    try:
+        if p.start_lock.read_text().strip() == str(os.getpid()):
+            p.start_lock.unlink()
+    except OSError:
+        pass
+
+
 def start_proxy(settings: dict[str, Any], store: common.SecretStore, background: bool) -> int:
+    p = common.paths()
+    acquire_start_lock(p)
+    try:
+        return _start_proxy_locked(settings, store, background, p)
+    finally:
+        release_start_lock(p)
+
+
+def _start_proxy_locked(settings: dict[str, Any], store: common.SecretStore, background: bool,
+                        p: common.Paths) -> int:
     for issue in common.require_valid(settings):
         warn(issue.message)
     state = proxy_state(settings)
@@ -335,13 +390,13 @@ def start_proxy(settings: dict[str, Any], store: common.SecretStore, background:
     common.write_runtime_config(settings)
     env = build_proxy_env(settings, store)
     cmd = _litellm_cmd(settings)
-    p = common.paths()
     if not background:
         info(f"Starting LiteLLM proxy in the foreground on {validate.proxy_base_url(settings)} "
              f"(model alias '{settings['model_alias']}' -> {settings['bedrock_model_id']} in {settings['aws_region']}).")
         info("Press Ctrl+C to stop.\n")
         proc = subprocess.Popen(cmd, env=env)
         common.write_pid(proc.pid, settings, "foreground", p)
+        release_start_lock(p)  # the PID file now marks it as ours; don't hold the lock for hours
         try:
             return proc.wait()
         except KeyboardInterrupt:
@@ -613,6 +668,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     step("Claude Code")
     report_claude(plat)
+    want_autostart = getattr(args, "autostart", False) or (interactive(args) and not autostart.status()["gateway"]["installed"]
+                                        and common.confirm("Start the gateway automatically when you log in?",
+                                                           default=True))
+    if want_autostart:
+        step("Autostart")
+        cmd_autostart(argparse.Namespace(action="enable", open_claude=getattr(args, "open_claude_at_login", False),
+                                         claude_workdir=None, no_start_now=True, json=False))
     p.setup_progress.unlink(missing_ok=True)
     info("\nSetup complete. Next steps:")
     wrapper = ".\\" if os.name == "nt" else "./"
@@ -898,7 +960,11 @@ def cmd_set_region(args: argparse.Namespace) -> int:
 def enable_classifier(args: argparse.Namespace, settings: dict[str, Any], store: common.SecretStore) -> None:
     c = settings["classifier"]
     backend = getattr(args, "backend", None) or "bedrock"
+    if backend == "kimi":
+        enable_kimi_self_review(args, settings)
+        return
     c["backend"] = backend
+    c["accept_kimi_self_review"] = False
     if backend == "bedrock":
         c["bedrock_model_id"] = getattr(args, "model_id", None) or c.get("bedrock_model_id") or \
             common.default_classifier_model_for_region(settings["aws_region"])
@@ -939,12 +1005,41 @@ def enable_classifier(args: argparse.Namespace, settings: dict[str, Any], store:
        f"{c['bedrock_model_id'] if backend == 'bedrock' else 'anthropic/' + c['anthropic_model']}")
 
 
+KIMI_SELF_REVIEW_WARNING = (
+    "Auto mode will use Kimi K3 to review Kimi K3's own actions. This is NOT an independent safety check: a "
+    "prompt injection (in a file, web page or tool output) that steers Kimi into a dangerous command can also "
+    "steer its approval. Claude Code's auto mode is designed around a separate Claude classifier.")
+
+
+def enable_kimi_self_review(args: argparse.Namespace, settings: dict[str, Any]) -> None:
+    """Unsafe opt-in: route Claude Code's classifier slot to Kimi K3 (what a plain LiteLLM setup does implicitly)."""
+    warn(KIMI_SELF_REVIEW_WARNING)
+    if not getattr(args, "accept_risk", False):
+        if not interactive(args):
+            raise GatewayError("Refusing to make Kimi K3 its own auto-mode reviewer without explicit consent.",
+                               hint="Re-run with --accept-risk, or configure a Claude classifier instead.",
+                               code="confirmation_required")
+        if not common.confirm("Use Kimi K3 as its own auto-mode reviewer anyway?", default=False):
+            raise GatewayError("Not enabled; auto mode stays disabled.", code="cancelled")
+    c = settings["classifier"]
+    c.update(backend="kimi", accept_kimi_self_review=True)
+    common.require_valid(settings)
+    common.save_settings(settings, common.paths())
+    ok(f"Auto-mode classifier route enabled: '{c['request_model']}' -> Kimi K3 ({settings['bedrock_model_id']}) "
+       "[UNSAFE opt-in: self-review]")
+    info("    Undo with: gateway classifier disable   (or switch to a Claude classifier: classifier enable "
+         "--model-id <Claude profile or ARN>)")
+
+
 def cmd_classifier(args: argparse.Namespace) -> int:
     settings, store = load()
     c = settings["classifier"]
     if args.action == "status":
         if c["backend"] == "none":
             info("Auto-mode classifier: not configured. claude-kimi launches Claude Code with auto mode disabled.")
+        elif c["backend"] == "kimi":
+            info(f"Auto-mode classifier: Kimi K3 reviewing its own actions (UNSAFE opt-in), requested by Claude "
+                 f"Code as '{c['request_model']}'.")
         else:
             target = c.get("bedrock_model_id") or common.default_classifier_model_for_region(settings["aws_region"])
             info(f"Auto-mode classifier: {c['backend']} ({target if c['backend'] == 'bedrock' else c['anthropic_model']})"
@@ -952,6 +1047,7 @@ def cmd_classifier(args: argparse.Namespace) -> int:
         return 0
     if args.action == "disable":
         c["backend"] = "none"
+        c["accept_kimi_self_review"] = False
         common.save_settings(settings, common.paths())
         common.write_runtime_config(settings)
         ok("Classifier route disabled; Claude Code will be launched with auto mode disabled.")
@@ -1023,14 +1119,8 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
     if parsed and parsed < common.MIN_CLAUDE_CODE:
         warn(f"Claude Code {version} is older than {'.'.join(map(str, common.MIN_CLAUDE_CODE))}; run 'claude update'.")
     master = get_secret(store, common.SECRET_MASTER_KEY)
-    health = validate.proxy_health(settings, master)
+    health = ensure_gateway_for_launch(args, settings, store, master)
     if not health.ok:
-        fail(health.message)
-        if health.code == "not_running" and interactive(args) and common.confirm(
-                "Start the gateway in the background now?", default=True):
-            if start_proxy(settings, store, background=True) != 0:
-                return 1
-            health = validate.proxy_health(settings, master)
         if not health.ok:
             raise GatewayError("The gateway is not healthy; not launching Claude Code.",
                                hint="Start it with ./start.sh (or .\\start.ps1) and check: gateway doctor",
@@ -1045,6 +1135,15 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
     elif c["request_model"] not in (health.detail or {}).get("models", []):
         warn("The classifier route is configured but the running gateway does not serve it; restart the gateway. "
              "Auto mode is disabled for this session.")
+    elif c["backend"] == "kimi" and not args.skip_classifier_check:
+        result = validate.proxy_messages_test(settings, master, c["request_model"], classifier=True)
+        classifier_ready = result.ok
+        if result.ok:
+            warn("Auto mode is available, but its reviewer is Kimi K3 itself (UNSAFE opt-in: classifier backend "
+                 "'kimi'). " + KIMI_SELF_REVIEW_WARNING.split(". ", 1)[1])
+        else:
+            fail("Classifier route check failed: " + result.message)
+            warn("Auto mode is disabled for this session.")
     elif args.skip_classifier_check:
         classifier_ready = True
         warn("Skipping the classifier connectivity check (--skip-classifier-check).")
@@ -1068,6 +1167,37 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
         return subprocess.call(argv, env=env)
     os.execvpe(claude, argv, env)
     return 0  # pragma: no cover
+
+
+def ensure_gateway_for_launch(args: argparse.Namespace, settings: dict[str, Any], store: common.SecretStore,
+                              master: str | None) -> validate.ProbeResult:
+    """Healthy gateway for the launcher: wait for one that is starting, or start it in the background."""
+    health = validate.proxy_health(settings, master)
+    if health.ok:
+        return health
+    state = proxy_state(settings)
+    starting = state["ours"] or common.paths().start_lock.exists()
+    if health.code == "not_running" and not starting:
+        auto = settings.get("start_gateway_on_launch", True)
+        if auto or (interactive(args) and common.confirm("Start the gateway in the background now?", default=True)):
+            info("The gateway is not running; starting it in the background ...")
+            if start_proxy(settings, store, background=True) != 0:
+                return validate.proxy_health(settings, master)
+            return validate.proxy_health(settings, master)
+        fail(health.message)
+        return health
+    if starting:
+        info("Waiting for the gateway to finish starting ...")
+        deadline = time.time() + STARTUP_TIMEOUT
+        while time.time() < deadline:
+            health = validate.proxy_health(settings, master, timeout=2)
+            if health.ok:
+                return health
+            if not proxy_state(settings)["ours"] and not common.paths().start_lock.exists():
+                break
+            time.sleep(1)
+    fail(health.message)
+    return health
 
 
 def cmd_internal_claude_env(args: argparse.Namespace) -> int:
@@ -1105,6 +1235,7 @@ def print_settings(settings: dict[str, Any]) -> None:
         ("Credential store", settings["credential_backend"]),
         ("LiteLLM (configured)", settings["litellm_version"]),
         ("Auto-mode classifier", c["backend"] if c["backend"] == "none" else
+         "kimi (UNSAFE: Kimi reviews its own actions)" if c["backend"] == "kimi" else
          f"{c['backend']} -> {c.get('bedrock_model_id') or common.default_classifier_model_for_region(settings['aws_region']) if c['backend'] == 'bedrock' else c['anthropic_model']}"),
     ]
     if settings.get("bedrock_endpoint_url"):
@@ -1122,6 +1253,57 @@ def installed_litellm_version() -> str | None:
     return out.stdout.strip() or None
 
 
+def _autostart_summary() -> str:
+    st = autostart.status()
+    if not st["gateway"]["installed"]:
+        return "off (enable with: gateway autostart enable)"
+    return "gateway" + (" + Claude Code" if st["claude"]["installed"] else "") + " at login"
+
+
+def cmd_autostart(args: argparse.Namespace) -> int:
+    settings, store = load()
+    if args.action == "status":
+        st = autostart.status()
+        if args.json:
+            print(json.dumps(st, indent=2))
+            return 0
+        for kind, title in (("gateway", "Gateway at login"), ("claude", "Claude Code at login")):
+            s = st[kind]
+            loaded = "" if "loaded" not in s else (", loaded" if s["loaded"] else ", not loaded")
+            info(f"    {title:<22}: {'on' if s['installed'] else 'off'}{loaded}  ({s['path']})")
+        return 0
+    if args.action == "disable":
+        removed = autostart.disable()
+        for path in removed:
+            ok(f"Removed {path}")
+        if not removed:
+            info("Autostart was not enabled; nothing to remove.")
+        info("The running gateway (if any) keeps running; stop it with: gateway stop")
+        return 0
+    # enable: refuse a login item that could only fail.
+    common.require_valid(settings)
+    if not bedrock_credential(settings, store) or not get_secret(store, common.SECRET_MASTER_KEY):
+        raise GatewayError("Credentials are missing, so the gateway could not start at login.",
+                           hint="Run setup first.", code="missing_token")
+    if args.open_claude and not validate.find_claude():
+        raise GatewayError("Claude Code is not installed or not on PATH.", code="claude_missing")
+    workdir = Path(args.claude_workdir).expanduser().resolve() if args.claude_workdir else Path.home()
+    if args.open_claude and not workdir.is_dir():
+        raise GatewayError(f"{workdir} is not a directory.", code="invalid_input")
+    written = autostart.enable(args.open_claude, workdir, load_gateway_now=not args.no_start_now)
+    for path in written:
+        ok(f"Wrote {path}")
+    ok("The gateway will start automatically when you log in"
+       + (f", and Claude Code (Kimi K3) will open in a terminal in {workdir}." if args.open_claude else "."))
+    if not args.no_start_now and common.detect_platform().system != "Darwin":
+        start_proxy(settings, store, background=True)
+    elif not args.no_start_now and os.environ.get("KGW_AUTOSTART_NO_LOAD") != "1":
+        info("Loaded the login item; it starts the gateway now if it isn't running (log: "
+             f"{common.paths().log_dir / 'autostart.log'}).")
+    info("claude-kimi also starts the gateway on demand, so Claude Code works even if the login item hasn't run.")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     settings, store = load()
     state = proxy_state(settings)
@@ -1135,6 +1317,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "aws_region": settings["aws_region"], "bedrock_model_id": settings["bedrock_model_id"],
             "model_alias": settings["model_alias"], "proxy": f"{settings['proxy_host']}:{settings['proxy_port']}",
             "classifier": settings["classifier"]["backend"]},
+        "autostart": {k: v["installed"] for k, v in autostart.status().items()},
     }
     if args.json:
         print(json.dumps(data, indent=2))
@@ -1150,6 +1333,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         info(f"    {'Process':<22}: not running")
     if health:
         info(f"    {'Health':<22}: {'healthy' if health.ok else 'unhealthy'} - {health.message}")
+    info(f"    {'Autostart':<22}: {_autostart_summary()}")
     return 0 if state["ours"] and health and health.ok else 1
 
 
@@ -1505,7 +1689,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     remove_config = args.remove_config
     remove_creds = args.remove_credentials
     info("Uninstall plan for the Kimi Bedrock Gateway (the repository itself is never deleted):")
-    info(f"  - stop the gateway if it is running")
+    info(f"  - remove the login items (autostart), if any, and stop the gateway if it is running")
     info(f"  - delete generated runtime files: {p.runtime_dir}, {p.pid_file.parent}, {p.log_dir}")
     if interactive(args) and not args.yes:
         remove_venv = remove_venv or common.confirm(f"Also delete the virtual environment {venv}?", default=False)
@@ -1519,6 +1703,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     if not args.yes and not (interactive(args) and common.confirm("Proceed?", default=False)):
         info("Nothing was changed.")
         return 1
+    for path in autostart.disable():
+        ok(f"Removed login item {path}")
     try:
         stop_proxy(settings, quiet=True)
     except Exception as exc:  # noqa: BLE001
@@ -1590,6 +1776,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--separate-credential", action="store_true")
     s.add_argument("--yes", action="store_true")
     s.add_argument("--allow-rosetta", action="store_true")
+    s.add_argument("--autostart", action="store_true", help="start the gateway automatically at login")
+    s.add_argument("--open-claude-at-login", action="store_true",
+                   help="with --autostart: also open Claude Code (Kimi K3) in a terminal at login")
 
     st = sub.add_parser("start", help="start the proxy (foreground by default)")
     st.add_argument("--background", action="store_true")
@@ -1622,6 +1811,13 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("--save-unvalidated", action="store_true", help="save even if validation fails")
     sa.add_argument("--restart", action="store_true", help="restart a running background proxy afterwards")
 
+    au = sub.add_parser("autostart", help="start the gateway (and optionally Claude Code) when you log in")
+    au.add_argument("action", choices=["status", "enable", "disable"])
+    au.add_argument("--open-claude", action="store_true", help="also open Claude Code in a terminal at login")
+    au.add_argument("--claude-workdir", help="folder Claude Code opens in at login (default: your home folder)")
+    au.add_argument("--no-start-now", action="store_true", help="only install the login items")
+    au.add_argument("--json", action="store_true")
+
     rm = sub.add_parser("rotate-master-key", help="generate a new local proxy master key")
     rm.add_argument("--yes", action="store_true")
     rm.add_argument("--restart", action="store_true")
@@ -1635,7 +1831,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     cl = sub.add_parser("classifier", help="auto-mode classifier route: status | enable | disable")
     cl.add_argument("action", choices=["status", "enable", "disable"])
-    cl.add_argument("--backend", choices=["bedrock", "anthropic"], default="bedrock")
+    cl.add_argument("--backend", choices=["bedrock", "anthropic", "kimi"], default="bedrock",
+                    help="kimi = Kimi K3 reviews its own actions (unsafe; needs --accept-risk)")
+    cl.add_argument("--accept-risk", action="store_true",
+                    help="with --backend kimi: confirm you accept Kimi K3 approving its own auto-mode actions")
     cl.add_argument("--model-id", help="Bedrock profile or application-profile ARN (bedrock), or model name (anthropic)")
     cl.add_argument("--base-model", help="for an application-profile ARN: the Claude model behind it "
                                          "(default anthropic.claude-sonnet-5)")
@@ -1674,7 +1873,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "bootstrap": cmd_bootstrap, "setup": cmd_setup, "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
     "status": cmd_status, "health": cmd_health, "logs": cmd_logs, "version": cmd_version, "config": cmd_config,
-    "update-key": cmd_update_key, "set-auth": cmd_set_auth, "rotate-master-key": cmd_rotate_master_key, "set-region": cmd_set_region,
+    "update-key": cmd_update_key, "set-auth": cmd_set_auth, "autostart": cmd_autostart, "rotate-master-key": cmd_rotate_master_key, "set-region": cmd_set_region,
     "classifier": cmd_classifier, "launch-claude": cmd_launch_claude, "_claude-env": cmd_internal_claude_env,
     "doctor": cmd_doctor, "scan-secrets": cmd_scan_secrets, "upgrade": cmd_upgrade, "uninstall": cmd_uninstall,
 }
