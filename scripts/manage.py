@@ -734,6 +734,10 @@ def report_claude(plat: common.PlatformInfo) -> None:
         warn("Claude Code is not installed (or not on PATH).")
         info("    " + validate.claude_install_hint(plat.system).replace("\n", "\n    "))
         return
+    if validate.claude_is_npm_placeholder(claude):
+        fail(f"{claude} is the npm package's placeholder, not a working Claude Code.")
+        info("    " + validate.claude_placeholder_hint(plat.system).replace("\n", "\n    "))
+        return
     version = validate.claude_version(claude)
     parsed = common.parse_version(version or "")
     if parsed and parsed < common.MIN_CLAUDE_CODE:
@@ -1114,6 +1118,9 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
     if not claude:
         raise GatewayError("Claude Code is not installed or not on PATH.",
                            hint=validate.claude_install_hint(plat.system), code="claude_missing")
+    if validate.claude_is_npm_placeholder(claude):
+        raise GatewayError(f"{claude} is not a working Claude Code: it's the npm package's placeholder.",
+                           hint=validate.claude_placeholder_hint(plat.system), code="claude_broken")
     version = validate.claude_version(claude)
     parsed = common.parse_version(version or "")
     if parsed and parsed < common.MIN_CLAUDE_CODE:
@@ -1163,9 +1170,14 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
          f"{env['ANTHROPIC_BASE_URL']} (credentials are passed only to this process).")
     info("Note: Claude Code may print an 'unrecognized model' notice for the custom alias; requests are still served "
          "by the gateway's Kimi K3 route.\n")
-    if os.name == "nt":
-        return subprocess.call(argv, env=env)
-    os.execvpe(claude, argv, env)
+    try:
+        if os.name == "nt":
+            return subprocess.call(argv, env=env)
+        os.execvpe(claude, argv, env)
+    except OSError as exc:
+        raise GatewayError(f"Could not start Claude Code at {claude}: {exc.strerror or exc}.",
+                           hint="Check that 'claude --version' works in this shell; if not, reinstall Claude Code.\n"
+                                + validate.claude_install_hint(plat.system), code="claude_broken") from None
     return 0  # pragma: no cover
 
 

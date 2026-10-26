@@ -341,16 +341,44 @@ def proxy_messages_test(settings: dict[str, Any], master_key: str, model: str | 
 # --------------------------------------------------------------- claude code
 
 
+# Since 2.1.x the npm package ships bin/claude.exe as a text placeholder that its postinstall
+# replaces with the native binary. If postinstall didn't run (--ignore-scripts, --omit=optional),
+# exec fails with "Exec format error" (verified on @anthropic-ai/claude-code 2.1.310).
+NPM_PLACEHOLDER_MARKER = b"native binary not installed"
+
+
+def claude_is_npm_placeholder(binary: str) -> bool:
+    try:
+        with open(os.path.realpath(binary), "rb") as fh:
+            return NPM_PLACEHOLDER_MARKER in fh.read(4096)
+    except OSError:
+        return False
+
+
+def claude_placeholder_hint(system: str) -> str:
+    installer = ("irm https://claude.ai/install.ps1 | iex" if system == "Windows"
+                 else "curl -fsSL https://claude.ai/install.sh | bash")
+    return ("The npm install of Claude Code skipped its install step, so only a placeholder exists. Fix one of:\n"
+            f"  - native installer (recommended):  {installer}   then: npm uninstall -g @anthropic-ai/claude-code\n"
+            "  - npm: check 'npm config get ignore-scripts' is false, then: npm install -g @anthropic-ai/claude-code@latest\n"
+            "  Then check:  claude --version")
+
+
 def find_claude() -> str | None:
+    """Claude Code on PATH (or ~/.local/bin), skipping a broken npm placeholder when a real one exists."""
     override = os.environ.get("KGW_CLAUDE_BIN")
     if override:
         return override if shutil.which(override) or os.path.exists(override) else None
+    placeholder = None
     for name in (("claude.exe", "claude.cmd", "claude") if os.name == "nt" else ("claude",)):
         found = shutil.which(name)
-        if found:
+        if found and not claude_is_npm_placeholder(found):
             return found
+        placeholder = placeholder or found
     home_local = os.path.join(os.path.expanduser("~"), ".local", "bin", "claude.exe" if os.name == "nt" else "claude")
-    return home_local if os.path.exists(home_local) else None
+    if os.path.exists(home_local) and not claude_is_npm_placeholder(home_local):
+        return home_local
+    return placeholder  # callers report it as broken
 
 
 def claude_version(binary: str) -> str | None:

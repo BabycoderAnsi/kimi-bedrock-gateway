@@ -1,6 +1,10 @@
 """Claude Code launcher environment and auto-mode policy."""
 
+import argparse
+import errno
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -61,3 +65,43 @@ def test_internal_env_refuses_tty(kgw_home, monkeypatch):
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     with pytest.raises(common.GatewayError):
         manage.cmd_internal_claude_env(None)
+
+
+# The npm package's bin/claude.exe before its postinstall runs (shape of @anthropic-ai/claude-code 2.1.310).
+NPM_PLACEHOLDER = ('echo "Error: claude native binary not installed." >&2\n'
+                   'echo "Either postinstall did not run (--ignore-scripts, some pnpm configs)" >&2\nexit 1\n')
+
+
+def _write_exe(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exec semantics")
+def test_npm_placeholder_is_detected_and_skipped_for_a_real_install(tmp_path, monkeypatch):
+    import validate  # noqa: PLC0415
+
+    npm_bin = _write_exe(tmp_path / "nvm" / "bin" / "claude", NPM_PLACEHOLDER)
+    monkeypatch.delenv("KGW_CLAUDE_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(npm_bin.parent))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert validate.claude_is_npm_placeholder(str(npm_bin))
+    assert validate.find_claude() == str(npm_bin)  # nothing better: returned so callers can report it
+    with pytest.raises(OSError) as exc:  # what the launcher used to crash with
+        subprocess.run([str(npm_bin)], check=False)
+    assert exc.value.errno == errno.ENOEXEC  # "Exec format error"
+    real = _write_exe(tmp_path / "home" / ".local" / "bin" / "claude", "#!/bin/sh\necho 2.1.310 (Claude Code)\n")
+    assert validate.find_claude() == str(real)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exec semantics")
+def test_launch_reports_placeholder_instead_of_traceback(kgw_home, tmp_path, monkeypatch):
+    npm_bin = _write_exe(tmp_path / "nvm" / "bin" / "claude", NPM_PLACEHOLDER)
+    monkeypatch.setenv("KGW_CLAUDE_BIN", str(npm_bin))
+    with pytest.raises(common.GatewayError) as exc:
+        manage.cmd_launch_claude(argparse.Namespace(claude_args=[], non_interactive=True,
+                                                    skip_classifier_check=False))
+    assert exc.value.code == "claude_broken"
+    assert "placeholder" in str(exc.value) and "install.sh" in exc.value.hint

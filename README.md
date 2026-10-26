@@ -755,6 +755,7 @@ Run `./gateway.sh doctor --live` first. Errors are classified as follows:
 | `foreign_listener` | a different LiteLLM/proxy answers on the port | stop it; the gateway won't use it |
 | `no_keyring` (Linux) | no Secret Service | see "Credential storage on headless Ubuntu" |
 | `claude_missing` | Claude Code not installed | see §1 |
+| `claude_broken`: *placeholder* / *Exec format error* on `…/.nvm/…/bin/claude` | npm installed Claude Code but skipped its install step (`ignore-scripts`, `--omit=optional`), leaving a text placeholder instead of the native binary | `curl -fsSL https://claude.ai/install.sh \| bash`, then `npm uninstall -g @anthropic-ai/claude-code`; check that `claude --version` works |
 | Claude Code shows *401*, or *400 No connected db* | Claude Code is using a different key (LiteLLM looks up unknown `sk-…` keys in a database it doesn't have, hence the odd message) | always launch with `claude-kimi`; check `ANTHROPIC_API_KEY` isn't forced elsewhere |
 | *auto mode cannot determine the safety …* / `kgw_classifier_refused` in logs | classifier unreachable, so the gateway kept it off Kimi | `./gateway.sh classifier status`; fix model access, or use Manual mode |
 
