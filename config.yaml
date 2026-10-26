@@ -1,0 +1,33 @@
+# LiteLLM proxy configuration TEMPLATE for the Kimi Bedrock Gateway.
+#
+# Do not edit secrets into this file. The manager (scripts/manage.py) renders it,
+# substituting the double-underscore placeholders from your settings, into a private runtime copy:
+#   macOS/Linux: ~/.config/kimi-bedrock-gateway/runtime/litellm-config.yaml
+#   Windows:     %APPDATA%\kimi-bedrock-gateway\runtime\litellm-config.yaml
+# Credentials are referenced as os.environ/NAME and injected into the proxy
+# process environment at start, read from the OS credential store.
+#
+# Tested with LiteLLM 1.106.0 (see requirements.txt).
+
+model_list:
+  # Primary coding model: Kimi K3 on Amazon Bedrock (Chat Completions by default; see kimi_api).
+  - model_name: __MODEL_ALIAS__
+    litellm_params:
+      model: __BEDROCK_MODEL__
+      aws_region_name: __AWS_REGION__
+      api_key: os.environ/AWS_BEARER_TOKEN_BEDROCK__ENDPOINT_LINE__
+__CLASSIFIER_BLOCK__
+litellm_settings:
+  # Kimi K3 compatibility adapter + auto-mode classifier routing guard.
+  # Module: gateway/kimi_gateway_hooks.py (put on PYTHONPATH by the manager).
+  callbacks: ["kimi_gateway_hooks.proxy_handler_instance"]
+  # Never log prompt/response bodies or key material.
+  turn_off_message_logging: true
+  redact_user_api_key_info: true
+  # Claude Code retries on its own; keep proxy-side retries low to avoid retry storms.
+  num_retries: 1
+  request_timeout: 600
+
+general_settings:
+  # Separate, randomly generated key that clients (Claude Code) use to reach this proxy.
+  master_key: os.environ/LITELLM_MASTER_KEY

@@ -1,0 +1,8 @@
+# EXPERIMENTAL - not installed by default and not part of the tested configuration.
+# Use only to try a newer LiteLLM while the stable pin above lags behind:
+#   gateway upgrade --litellm <version> --allow-prerelease
+# The upgrade command stages the new version in a separate venv, runs the unit
+# tests and the Kimi look-around compatibility check, and keeps the previous venv
+# for one-command rollback (gateway upgrade --rollback).
+#
+# litellm[proxy]==1.107.0rc1   # release candidate, 2026-10-18 - untested here

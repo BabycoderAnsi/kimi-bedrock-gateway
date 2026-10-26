@@ -1,0 +1,37 @@
+# Virtual environments (created by setup)
+.venv/
+.venv-upgrade/
+.venv.previous/
+.venv.failed/
+
+# Secrets must never be committed. The gateway keeps credentials in the OS
+# credential store (or a 0600 file in the private state dir, outside the repo).
+.env
+.env.*
+*.env
+secrets.json
+*.pem
+*.key
+litellm-config.yaml
+settings.json
+
+# Runtime artefacts if KGW_HOME is pointed inside the repo
+.kgw/
+*.pid
+*.log
+logs/
+
+# Python / tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

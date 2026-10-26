@@ -1,0 +1,21 @@
+# Stable, tested runtime dependencies for the Kimi Bedrock Gateway.
+# Installed into the project's .venv only (never globally) by setup.sh / setup.ps1.
+#
+# LiteLLM 1.106.0 (stable, 2026-10-18) is the first stable release that knows
+# Kimi K3 on Bedrock does not accept regex look-around in tool schemas
+# (model map flag supports_regex_lookaround=false, PR #44138) and drops those
+# patterns on the Converse path. 1.105.1 forwards them and Bedrock rejects the request.
+# Change it only with:  gateway upgrade --litellm X.Y.Z   (stages + tests before switching)
+litellm[proxy]==1.106.0
+
+# OS credential stores: Windows Credential Manager, macOS Keychain, Linux Secret Service.
+# On Linux keyring pulls in SecretStorage/jeepney; on Windows pywin32-ctypes.
+keyring==25.7.0
+
+# Process identity checks for start/stop/status (is the PID really our proxy?).
+psutil==7.2.2
+
+# Not used as a database: LiteLLM 1.106.0's auth-failure handler imports `prisma.errors`
+# even without a DB, so a wrong/missing proxy key produced HTTP 500 (ModuleNotFoundError)
+# instead of 401. Installing the client library (no generated client, no binaries) restores 401.
+prisma==0.15.0
