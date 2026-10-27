@@ -109,22 +109,49 @@ cd ~/code/my-project
 ~/Desktop/kimi-bedrock-gateway/claude-kimi.sh --permission-mode auto
 ```
 
-To shorten that, add a shell alias once (zsh shown; use `~/.bashrc` for bash). Replace the path with
-wherever you cloned this repo:
+**Make `claude-kimi` a command you can run anywhere.** Install a tiny wrapper script in
+`~/.local/bin`. Claude Code's native installer already puts that folder on your PATH on macOS, Linux
+and Windows, so usually no PATH change is needed. Run these **from this repo's folder**, so the wrapper
+records where the gateway lives. If you move or re-clone the repo, run them again.
+
+macOS / Linux:
 
 ```bash
-echo "alias claude-kimi='$HOME/Desktop/kimi-bedrock-gateway/claude-kimi.sh'" >> ~/.zshrc
-source ~/.zshrc
+mkdir -p ~/.local/bin
+printf '#!/bin/sh\nexec "%s/claude-kimi.sh" "$@"\n' "$PWD" > ~/.local/bin/claude-kimi
+chmod +x ~/.local/bin/claude-kimi
+which claude-kimi        # nothing printed? add  export PATH="$HOME/.local/bin:$PATH"  to ~/.zshrc (or ~/.bashrc)
+```
 
+Windows (PowerShell). The wrapper works in both PowerShell and cmd:
+
+```powershell
+$target = (Resolve-Path .\claude-kimi.ps1).Path
+New-Item -ItemType Directory -Force "$HOME\.local\bin" | Out-Null
+Set-Content -Encoding ASCII "$HOME\.local\bin\claude-kimi.cmd" "@powershell -NoProfile -ExecutionPolicy Bypass -File `"$target`" %*"
+```
+
+`-ExecutionPolicy Bypass` applies only to that one PowerShell process; the machine policy is unchanged.
+Open a new terminal. If `claude-kimi` isn't found (check with `where.exe claude`), add the folder to
+your user PATH. No admin is needed:
+
+```powershell
+$p = [Environment]::GetEnvironmentVariable('Path','User')
+if ($p -notlike "*$HOME\.local\bin*") { [Environment]::SetEnvironmentVariable('Path', "$p;$HOME\.local\bin", 'User') }
+```
+
+Then, from any project:
+
+```bash
 cd ~/code/my-project
 claude-kimi                           # or: claude-kimi --permission-mode auto
 ```
 
-Use an alias, not a symlink in `~/.local/bin`. The script looks for its helper files next to its own
-path, so a symlinked copy can't find them. On Windows, call
-`& "$HOME\Desktop\kimi-bedrock-gateway\claude-kimi.ps1"` from your project folder, or add a function
-to your PowerShell profile:
-`function claude-kimi { & "$HOME\Desktop\kimi-bedrock-gateway\claude-kimi.ps1" @args }`.
+Use the wrapper, not a symlink. The launcher looks for its helper files next to its own path, so a
+symlinked copy can't find them. Alternatives that also work:
+- zsh/bash alias: `alias claude-kimi='<repo>/claude-kimi.sh'` in `~/.zshrc`. This works in interactive
+  shells only.
+- PowerShell profile function: `function claude-kimi { & "<repo>\claude-kimi.ps1" @args }`.
 
 To skip even that, enable autostart once (§3, "Start automatically at login"):
 
@@ -792,6 +819,7 @@ Run `./gateway.sh doctor --live` first. Errors are classified as follows:
 | `port_in_use` | another program holds 127.0.0.1:4000 | stop it, or change `proxy_port` |
 | `foreign_listener` | a different LiteLLM/proxy answers on the port | stop it; the gateway won't use it |
 | `no_keyring` (Linux) | no Secret Service | see "Credential storage on headless Ubuntu" |
+| Windows: *The proxy exited during startup* with `UnicodeEncodeError: 'charmap' codec can't encode characters` in `show_banner` | gateway versions before this fix ran LiteLLM in the Windows ANSI code page (cp1252); its Unicode startup banner can't be written to the background log | `git pull` (the proxy now runs in Python UTF-8 mode), then rerun setup or `.\start.ps1 --background` |
 | `claude_missing` | Claude Code not installed | see §1 |
 | `claude_broken`: *placeholder* / *Exec format error* on `…/.nvm/…/bin/claude` | npm installed Claude Code but skipped its install step (`ignore-scripts`, `--omit=optional`), leaving a text placeholder instead of the native binary | `curl -fsSL https://claude.ai/install.sh \| bash`, then `npm uninstall -g @anthropic-ai/claude-code`; check that `claude --version` works |
 | Claude Code shows *401*, or *400 No connected db* | Claude Code is using a different key (LiteLLM looks up unknown `sk-…` keys in a database it doesn't have, hence the odd message) | always launch with `claude-kimi`; check `ANTHROPIC_API_KEY` isn't forced elsewhere |
