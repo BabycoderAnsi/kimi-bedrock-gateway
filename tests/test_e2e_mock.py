@@ -193,6 +193,22 @@ def test_access_key_auth_signs_every_request(tmp_path):
         gw.close()
 
 
+def test_background_start_and_logs_survive_a_legacy_codepage(tmp_path, monkeypatch):
+    """Recreates Windows' cp1252 output on any OS: the proxy must start and 'logs' must not crash."""
+    if not VENV_PY.exists():
+        pytest.skip("project venv not installed")
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    gw = Gateway(tmp_path)  # starts the proxy in the background (log redirected to a file)
+    try:
+        status, body = gw.post(MULTI_TURN)
+        assert status == 200, body
+        out = gw.manage("logs", "-n", "200")  # banner lines include characters cp1252 can't encode
+        assert "Traceback" not in out and "UnicodeEncodeError" not in out
+        assert "UnicodeEncodeError" not in (gw.home / "logs" / "proxy.log").read_text(encoding="utf-8")
+    finally:
+        gw.close()
+
+
 def test_classifier_requests_never_reach_kimi(gateway):
     body = {"model": "kimi-k3", "max_tokens": 64, "stop_sequences": ["</block>"],
             "system": "You are a security monitor for autonomous AI coding agents.",

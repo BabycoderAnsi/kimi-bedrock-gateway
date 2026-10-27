@@ -275,6 +275,12 @@ def build_proxy_env(settings: dict[str, Any], store: common.SecretStore) -> dict
         "DISABLE_ADMIN_UI": "True",
         "LITELLM_LOG": env.get("KGW_LITELLM_LOG", "INFO"),
         "PYTHONUNBUFFERED": "1",
+        # The background log is a file, which Windows Python writes in the ANSI code page (cp1252)
+        # unless told otherwise; LiteLLM's Unicode startup banner then raises UnicodeEncodeError and
+        # the proxy exits. UTF-8 mode matches what macOS/Linux already default to, and an inherited
+        # PYTHONIOENCODING would override it, so set both. tail_log() reads the log as UTF-8.
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
     })
     c = settings["classifier"]
     if c["backend"] != "none":
@@ -1891,7 +1897,19 @@ COMMANDS = {
 }
 
 
+def _tolerant_stdio() -> None:
+    """Never crash on output: a redirected Windows stdout uses the ANSI code page, and log lines
+    shown by 'logs' or after a failed start can contain characters it can't encode."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _tolerant_stdio()
     raw = list(argv if argv is not None else sys.argv[1:])
     non_interactive = "--non-interactive" in raw
     parsed_argv = [a for a in raw if a != "--non-interactive"]

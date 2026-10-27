@@ -105,3 +105,17 @@ def test_launch_reports_placeholder_instead_of_traceback(kgw_home, tmp_path, mon
                                                     skip_classifier_check=False))
     assert exc.value.code == "claude_broken"
     assert "placeholder" in str(exc.value) and "install.sh" in exc.value.hint
+
+
+def test_proxy_runs_in_utf8_mode_even_with_a_legacy_codepage(kgw_home, monkeypatch):
+    """Windows writes redirected output in cp1252; LiteLLM's banner then crashed the background proxy."""
+    monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    s = common.default_settings()
+    common.save_settings(s)
+    store = common.store_for(dict(s, credential_backend="file"))
+    s["credential_backend"] = "file"
+    store.set(common.SECRET_BEDROCK_TOKEN, "test-token-value-123")
+    store.set(common.SECRET_MASTER_KEY, "sk-kgw-" + "t" * 30)  # kgw-scan: allow (fake test key)
+    env = manage.build_proxy_env(s, store)
+    assert env["PYTHONUTF8"] == "1" and env["PYTHONIOENCODING"] == "utf-8"
