@@ -74,9 +74,9 @@ If you're not sure, ask your AWS admin for the IAM policy on your user. If Bedro
 
 ### Step 3: run setup once
 
-```bash
-# macOS / Ubuntu. Windows: .\setup.ps1 with the same options.
+macOS / Ubuntu:
 
+```bash
 # Bedrock API key, default India profile:
 ./setup.sh
 
@@ -86,9 +86,33 @@ If you're not sure, ask your AWS admin for the IAM policy on your user. If Bedro
   --autostart --open-claude-at-login
 ```
 
+Windows: open **PowerShell** in the repo folder and run the same options. Don't use Command Prompt.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 --auth access-key `
+  --model-id arn:aws:bedrock:ap-south-1:<account>:application-inference-profile/<id> `
+  --autostart --open-claude-at-login
+```
+
 Setup asks for the credential with input hidden, checks it with one tiny request to Bedrock, and
 stores it in the OS credential store. It then renders the LiteLLM config and runs a short live test
-through the gateway. Re-running setup is safe and keeps what already works.
+through the gateway.
+
+It then takes care of the rest, asking a yes/no question before each change:
+
+| Setup asks | What happens if you say yes |
+|---|---|
+| *Install Claude Code now with the official installer from claude.ai?* (only if it's missing, or is only a broken npm placeholder) | runs Anthropic's installer (`install.ps1` / `install.sh`) |
+| *Install the 'claude-kimi' command in `~/.local/bin`…?* | writes a small launcher so `claude-kimi` works from any folder |
+| *Add `~/.local/bin` to your PATH…?* (Windows, only if it's missing) | adds it to **your user** PATH. No admin rights; existing entries are kept |
+| *Start the gateway automatically when you log in?* | creates the login item (§3) |
+
+On macOS and Linux, setup never edits your shell startup files. If `~/.local/bin` isn't on your PATH,
+it prints the one line to add. For unattended runs, `--install-claude`, `--install-command` and
+`--add-to-path` answer yes, and `--no-command` skips the command.
+
+When setup finishes, **open a new terminal window** if it changed your PATH. Re-running setup is safe
+and keeps what already works.
 
 ### Step 4: use it every day
 
@@ -109,7 +133,21 @@ cd ~/code/my-project
 ~/Desktop/kimi-bedrock-gateway/claude-kimi.sh --permission-mode auto
 ```
 
-**Make `claude-kimi` a command you can run anywhere.** Install a tiny wrapper script in
+**Make `claude-kimi` a command you can run anywhere.** Setup offers this (see step 3). To do it later,
+or to check it, run:
+
+```bash
+./gateway.sh command install        # Windows: .\gateway.ps1 command install   (asks before changing PATH)
+./gateway.sh command status
+./gateway.sh command remove         # uninstall also removes it
+```
+
+`./gateway.sh doctor` reports whether the command is installed and on your PATH. It also reports whether
+`claude` itself is reachable by name.
+
+<details><summary>Doing the same by hand</summary>
+
+Install a tiny wrapper script in
 `~/.local/bin`. Claude Code's native installer already puts that folder on your PATH on macOS, Linux
 and Windows, so usually no PATH change is needed. Run these **from this repo's folder**, so the wrapper
 records where the gateway lives. If you move or re-clone the repo, run them again.
@@ -153,6 +191,8 @@ symlinked copy can't find them. Alternatives that also work:
   shells only.
 - PowerShell profile function: `function claude-kimi { & "<repo>\claude-kimi.ps1" @args }`.
 
+</details>
+
 To skip even that, enable autostart once (§3, "Start automatically at login"):
 
 ```bash
@@ -193,6 +233,7 @@ On Windows, use the `.ps1` version of each script (`.\gateway.ps1 <command>`).
 |---|---|
 | Start / stop / restart the gateway | `./start.sh [--background]`, `./gateway.sh stop`, `./gateway.sh restart` |
 | Launch Claude Code through the gateway | `./claude-kimi.sh [claude args…]` |
+| `claude-kimi` command from any folder | `./gateway.sh command install` / `status` / `remove` |
 | Start at login (± Claude Code) | `./gateway.sh autostart enable [--open-claude] [--claude-workdir DIR]` / `disable` / `status` |
 | Replace the Bedrock API key | `./update-bedrock-key.sh [--restart]` (`--rollback` restores the previous one) |
 | Switch to / replace IAM access keys | `./gateway.sh set-auth access-key [--replace] [--restart]` |
@@ -923,8 +964,16 @@ or anything else.
   download (`LITELLM_LOCAL_MODEL_COST_MAP`).
 * **Credential validation goes only to AWS** (or to the Anthropic API for that classifier backend).
   Redirects are never followed with credentials attached.
-* **No system-wide changes.** No `sudo`, no administrator rights, no execution-policy change, no
-  PATH or global environment edits. Windows ACLs are set only on the gateway's own files.
+* **No system-wide changes.** No `sudo`, no administrator rights, no execution-policy change, and no
+  machine-wide PATH or global environment edits. Windows ACLs are set only on the gateway's own files.
+  The only per-user changes are those you agree to in setup:
+  * the `claude-kimi` command in `~/.local/bin`. It's marked as generated, and a file that isn't ours
+    is never overwritten or removed;
+  * on Windows, `~/.local/bin` added to your **user** PATH. The registry value is edited in place,
+    keeping existing entries and their `%VARIABLES%`, unlike `setx`, which can truncate PATH. Uninstall
+    leaves this entry, because Claude Code uses the folder too;
+  * login items;
+  * running Anthropic's official Claude Code installer.
 * **Background mode** keeps credentials in the memory of a long-lived process owned by you. Prefer
   foreground mode on shared machines, and stop the gateway when you're done.
 * **Auto Mode** classification never runs on Kimi K3 unless you explicitly opt in with
@@ -1002,6 +1051,7 @@ scripts/manage.py              the CLI every wrapper calls
 scripts/lib.{sh,ps1}           wrapper helpers (Python discovery, venv lookup)
 scripts/claude-code-env.ps1    dot-source to configure the current PowerShell session
 scripts/autostart.py           login items: LaunchAgent (macOS), XDG autostart (Linux), Startup folder (Windows)
+scripts/userbin.py             claude-kimi command in ~/.local/bin, Windows user PATH, Claude Code installer
 gateway/kimi_gateway_hooks.py  LiteLLM pre-call hook: Kimi adapter + classifier guard
 tests/                         unit, offline e2e (mock_bedrock.py), opt-in live tests
 ```

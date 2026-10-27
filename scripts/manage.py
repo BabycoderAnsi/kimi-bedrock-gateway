@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import common  # noqa: E402
 import autostart  # noqa: E402
+import userbin  # noqa: E402
 import validate  # noqa: E402
 from common import GatewayError  # noqa: E402
 
@@ -673,21 +674,36 @@ def cmd_setup(args: argparse.Namespace) -> int:
     save_progress("selftest")
 
     step("Claude Code")
+    ensure_claude_code(args, plat)
     report_claude(plat)
+
+    step("claude-kimi command")
+    command_ready, path_changed = ensure_claude_kimi_command(args)
+
     want_autostart = getattr(args, "autostart", False) or (interactive(args) and not autostart.status()["gateway"]["installed"]
                                         and common.confirm("Start the gateway automatically when you log in?",
                                                            default=True))
     if want_autostart:
         step("Autostart")
-        cmd_autostart(argparse.Namespace(action="enable", open_claude=getattr(args, "open_claude_at_login", False),
+        open_claude = getattr(args, "open_claude_at_login", False)
+        if open_claude and not _claude_usable():
+            warn("Claude Code isn't installed, so only the gateway will start at login. After installing Claude "
+                 "Code, run: gateway autostart enable --open-claude")
+            open_claude = False
+        cmd_autostart(argparse.Namespace(action="enable", open_claude=open_claude,
                                          claude_workdir=None, no_start_now=True, json=False))
     p.setup_progress.unlink(missing_ok=True)
     info("\nSetup complete. Next steps:")
     wrapper = ".\\" if os.name == "nt" else "./"
     ext = ".ps1" if os.name == "nt" else ".sh"
-    info(f"  1. Start the gateway:        {wrapper}start{ext}            (foreground; Ctrl+C stops it)")
-    info(f"  2. In another terminal:      {wrapper}claude-kimi{ext}       (Claude Code through the gateway)")
-    info(f"  Status / logs / doctor:      {wrapper}gateway{ext} status | logs | doctor")
+    if command_ready:
+        info("  Open your project folder in a terminal and run:   claude-kimi")
+        if path_changed:
+            info("  (Open a NEW terminal window first, so it sees the updated PATH.)")
+    else:
+        info(f"  From your project folder run:  {common.REPO_ROOT / ('claude-kimi' + ext)}")
+    info("  claude-kimi starts the gateway when it isn't running; you never need to start it by hand.")
+    info(f"  Status / logs / doctor:        {wrapper}gateway{ext} status | logs | doctor")
     if interactive(args) and validate.find_claude() and proxy_state(settings)["ours"] and common.confirm(
             "Launch Claude Code through the gateway now?", default=False):
         return cmd_launch_claude(argparse.Namespace(claude_args=[], non_interactive=False,
@@ -732,6 +748,106 @@ def run_gateway_selftest(args: argparse.Namespace, settings: dict[str, Any], sto
             stop_proxy(settings, quiet=True)
 
 
+def _claude_usable() -> bool:
+    claude = validate.find_claude()
+    return bool(claude) and not validate.claude_is_npm_placeholder(claude)
+
+
+def ensure_claude_code(args: argparse.Namespace, plat: common.PlatformInfo) -> None:
+    """Offer Anthropic's official installer when Claude Code is missing or a broken npm placeholder."""
+    if _claude_usable():
+        return
+    claude = validate.find_claude()
+    problem = ("is only an npm placeholder (its install step never ran)" if claude
+               else "is not installed")
+    warn(f"Claude Code {problem}. The gateway works without it, but claude-kimi needs it.")
+    want = getattr(args, "install_claude", False) or (interactive(args) and common.confirm(
+        "Install Claude Code now with the official installer from claude.ai?", default=True))
+    if not want:
+        info("    " + validate.claude_install_hint(plat.system).replace("\n", "\n    "))
+        return
+    info("Running the official Claude Code installer ...\n")
+    try:
+        code = userbin.install_claude_code()
+    except GatewayError as exc:
+        fail(str(exc))
+        return
+    if code != 0 or not _claude_usable():
+        fail("The Claude Code installer did not finish successfully (see its output above).")
+        info("    " + validate.claude_install_hint(plat.system).replace("\n", "\n    "))
+    else:
+        ok(f"Claude Code installed at {validate.find_claude()}.")
+
+
+def ensure_command_dir_on_path(args: argparse.Namespace) -> bool:
+    """Returns True if the user PATH was changed (new terminals needed)."""
+    directory = userbin.command_dir()
+    if userbin.path_status(directory)["persistent"]:
+        return False
+    if os.name != "nt":
+        warn(f"{directory} is not on your PATH, so 'claude-kimi' won't be found by name yet.")
+        info("    " + userbin.posix_path_hint(directory))
+        return False
+    want = getattr(args, "add_to_path", False) or (interactive(args) and common.confirm(
+        f"Add {directory} to your PATH so 'claude' and 'claude-kimi' work in every terminal? "
+        "(your user only; no admin rights)", default=True))
+    if not want:
+        warn(f"{directory} is not on your PATH; run the full path instead, or later: gateway command install --add-to-path")
+        return False
+    changed = userbin.add_to_user_path(directory)
+    ok(f"Added {directory} to your user PATH." if changed else f"{directory} is already on your user PATH.")
+    return changed
+
+
+def ensure_claude_kimi_command(args: argparse.Namespace) -> tuple[bool, bool]:
+    """Install the claude-kimi command (asked first). Returns (usable by name, PATH changed)."""
+    st = userbin.command_status()
+    if st["foreign"]:
+        warn(f"{st['path']} already exists and wasn't created by this gateway; not touching it.")
+        return False, False
+    if getattr(args, "no_command", False):
+        return False, False
+    if not st["installed"] and not (getattr(args, "install_command", False) or (interactive(args) and common.confirm(
+            f"Install the 'claude-kimi' command in {userbin.command_dir()}, so you can start Claude Code with Kimi "
+            "from any folder?", default=True))):
+        info("    Skipped. Install it later with: gateway command install")
+        return False, False
+    try:
+        changed = userbin.install_command()
+    except GatewayError as exc:
+        fail(str(exc))
+        return False, False
+    ok(("Installed" if changed else "Already installed:") + f" {st['path']}")
+    path_changed = ensure_command_dir_on_path(args)
+    return userbin.path_status()["persistent"], path_changed
+
+
+def cmd_command(args: argparse.Namespace) -> int:
+    if args.action == "status":
+        st = userbin.command_status()
+        state = ("installed" if st["current"] else "installed (outdated; run: gateway command install)") \
+            if st["installed"] else "NOT ours (left alone)" if st["foreign"] else "not installed"
+        info(f"    {'claude-kimi command':<22}: {state}  ({st['path']})")
+        on_path = st["dir_on_path"]["persistent"]
+        info(f"    {'Folder on PATH':<22}: {'yes' if on_path else 'NO'}"
+             + ("" if on_path or os.name == "nt" else "  - " + userbin.posix_path_hint()))
+        if os.name == "nt" and on_path and not st["dir_on_path"]["now"]:
+            info("    (This terminal predates the PATH change; open a new one.)")
+        return 0 if st["installed"] and on_path else 1
+    if args.action == "remove":
+        if userbin.remove_command():
+            ok(f"Removed {userbin.command_path()}")
+        else:
+            info("The claude-kimi command was not installed by this gateway; nothing removed.")
+        info(f"    {userbin.command_dir()} stays on your PATH (other tools, like Claude Code, use it too).")
+        return 0
+    changed = userbin.install_command()
+    ok(("Installed" if changed else "Already up to date:") + f" {userbin.command_path()}")
+    if ensure_command_dir_on_path(argparse.Namespace(add_to_path=args.add_to_path, non_interactive=args.non_interactive)):
+        info("    Open a NEW terminal window, then run claude-kimi from any folder.")
+    return 0
+
+
 def report_claude(plat: common.PlatformInfo) -> None:
     claude = validate.find_claude()
     node = validate.node_version()
@@ -744,6 +860,10 @@ def report_claude(plat: common.PlatformInfo) -> None:
         fail(f"{claude} is the npm package's placeholder, not a working Claude Code.")
         info("    " + validate.claude_placeholder_hint(plat.system).replace("\n", "\n    "))
         return
+    if not shutil.which(os.path.basename(claude)) and not os.environ.get("KGW_CLAUDE_BIN"):
+        warn(f"Claude Code is at {claude}, but that folder isn't on your PATH, so 'claude' won't be found by name.")
+        info("    " + ("Fix: gateway command install --add-to-path   (then open a new terminal)" if os.name == "nt"
+                       else userbin.posix_path_hint(Path(claude).parent)))
     version = validate.claude_version(claude)
     parsed = common.parse_version(version or "")
     if parsed and parsed < common.MIN_CLAUDE_CODE:
@@ -1303,8 +1423,11 @@ def cmd_autostart(args: argparse.Namespace) -> int:
     if not bedrock_credential(settings, store) or not get_secret(store, common.SECRET_MASTER_KEY):
         raise GatewayError("Credentials are missing, so the gateway could not start at login.",
                            hint="Run setup first.", code="missing_token")
-    if args.open_claude and not validate.find_claude():
-        raise GatewayError("Claude Code is not installed or not on PATH.", code="claude_missing")
+    if args.open_claude and not _claude_usable():
+        raise GatewayError("Claude Code is not installed (or only as a broken npm placeholder).",
+                           hint="Re-run setup and let it install Claude Code, or: "
+                                + validate.claude_install_hint(common.detect_platform().system).splitlines()[0],
+                           code="claude_missing")
     workdir = Path(args.claude_workdir).expanduser().resolve() if args.claude_workdir else Path.home()
     if args.open_claude and not workdir.is_dir():
         raise GatewayError(f"{workdir} is not a directory.", code="invalid_input")
@@ -1490,6 +1613,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         info("    Not running (start it with ./start.sh).")
     step("Claude Code & auto mode")
     report_claude(plat)
+    cst = userbin.command_status()
+    if cst["installed"] and cst["dir_on_path"]["persistent"]:
+        ok(f"claude-kimi command: {cst['path']}" + ("" if cst["current"] else " (outdated; run: gateway command install)"))
+    elif cst["installed"]:
+        warn(f"claude-kimi command installed at {cst['path']}, but its folder isn't on PATH.")
+        info("    " + ("Fix: gateway command install --add-to-path" if os.name == "nt" else userbin.posix_path_hint()))
+    elif cst["foreign"]:
+        warn(f"{cst['path']} exists but wasn't created by this gateway.")
+    else:
+        info("    claude-kimi command: not installed (optional; gateway command install)")
     c = settings["classifier"]
     if c["backend"] == "none":
         info("    Auto mode: disabled by the launcher (no supported Claude classifier configured).")
@@ -1723,6 +1856,8 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         return 1
     for path in autostart.disable():
         ok(f"Removed login item {path}")
+    if userbin.remove_command():
+        ok(f"Removed the claude-kimi command {userbin.command_path()}")
     try:
         stop_proxy(settings, quiet=True)
     except Exception as exc:  # noqa: BLE001
@@ -1795,6 +1930,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--yes", action="store_true")
     s.add_argument("--allow-rosetta", action="store_true")
     s.add_argument("--autostart", action="store_true", help="start the gateway automatically at login")
+    s.add_argument("--install-claude", action="store_true",
+                   help="install Claude Code with the official installer if it's missing (no prompt)")
+    s.add_argument("--install-command", action="store_true",
+                   help="install the claude-kimi command in ~/.local/bin (no prompt)")
+    s.add_argument("--no-command", action="store_true", help="don't install the claude-kimi command")
+    s.add_argument("--add-to-path", action="store_true",
+                   help="Windows: add ~/.local/bin to your user PATH if needed (no prompt)")
     s.add_argument("--open-claude-at-login", action="store_true",
                    help="with --autostart: also open Claude Code (Kimi K3) in a terminal at login")
 
@@ -1828,6 +1970,10 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("--no-validate", action="store_true")
     sa.add_argument("--save-unvalidated", action="store_true", help="save even if validation fails")
     sa.add_argument("--restart", action="store_true", help="restart a running background proxy afterwards")
+
+    cm = sub.add_parser("command", help="the claude-kimi command (run Claude Code with Kimi from any folder)")
+    cm.add_argument("action", choices=["install", "remove", "status"])
+    cm.add_argument("--add-to-path", action="store_true", help="Windows: add its folder to your user PATH (no prompt)")
 
     au = sub.add_parser("autostart", help="start the gateway (and optionally Claude Code) when you log in")
     au.add_argument("action", choices=["status", "enable", "disable"])
@@ -1891,7 +2037,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "bootstrap": cmd_bootstrap, "setup": cmd_setup, "start": cmd_start, "stop": cmd_stop, "restart": cmd_restart,
     "status": cmd_status, "health": cmd_health, "logs": cmd_logs, "version": cmd_version, "config": cmd_config,
-    "update-key": cmd_update_key, "set-auth": cmd_set_auth, "autostart": cmd_autostart, "rotate-master-key": cmd_rotate_master_key, "set-region": cmd_set_region,
+    "update-key": cmd_update_key, "set-auth": cmd_set_auth, "autostart": cmd_autostart, "command": cmd_command, "rotate-master-key": cmd_rotate_master_key, "set-region": cmd_set_region,
     "classifier": cmd_classifier, "launch-claude": cmd_launch_claude, "_claude-env": cmd_internal_claude_env,
     "doctor": cmd_doctor, "scan-secrets": cmd_scan_secrets, "upgrade": cmd_upgrade, "uninstall": cmd_uninstall,
 }

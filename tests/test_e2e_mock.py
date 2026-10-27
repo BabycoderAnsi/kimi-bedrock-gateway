@@ -209,6 +209,31 @@ def test_background_start_and_logs_survive_a_legacy_codepage(tmp_path, monkeypat
         gw.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX wrapper; the .cmd variant is unit-tested")
+def test_installed_claude_kimi_command_works_from_any_folder(gateway, tmp_path):
+    """gateway command install -> claude-kimi (from another folder) -> launcher -> gateway -> Claude Code."""
+    fake = tmp_path / "fake-claude"
+    fake.write_text("#!/bin/sh\n"
+                    'if [ "$1" = "--version" ]; then echo "2.1.310 (Claude Code)"; exit 0; fi\n'
+                    'printf \'%s\\n\' "PWD=$PWD" "BASE=$ANTHROPIC_BASE_URL" "MODEL=$ANTHROPIC_MODEL" "$@"\n')
+    fake.chmod(0o755)
+    out = gateway.manage("command", "install")
+    assert "Installed" in out
+    command = Path(os.environ["KGW_COMMAND_DIR"]) / "claude-kimi"
+    project = tmp_path / "some project"
+    project.mkdir()
+    proc = subprocess.run([str(command), "-p", "explain this repo", "--resume"], cwd=project,
+                          env={**gateway.env, "KGW_CLAUDE_BIN": str(fake)}, capture_output=True, text=True, timeout=120)
+    lines = proc.stdout.splitlines()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"PWD={project}" in lines  # Claude Code opens in the folder it was run from
+    assert f"BASE=http://127.0.0.1:{gateway.proxy_port}" in lines and "MODEL=kimi-k3" in lines
+    assert lines[-3:] == ["-p", "explain this repo", "--resume"]  # arguments (with spaces) intact
+    assert "claude-kimi command" in gateway.manage("doctor", check=False)
+    gateway.manage("command", "remove")
+    assert not command.exists()
+
+
 def test_classifier_requests_never_reach_kimi(gateway):
     body = {"model": "kimi-k3", "max_tokens": 64, "stop_sequences": ["</block>"],
             "system": "You are a security monitor for autonomous AI coding agents.",

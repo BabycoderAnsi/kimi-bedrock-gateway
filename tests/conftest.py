@@ -44,6 +44,9 @@ def isolated_login_items(tmp_path_factory, monkeypatch):
     for var in ("KGW_LAUNCH_AGENTS_DIR", "KGW_XDG_AUTOSTART_DIR", "KGW_STARTUP_DIR"):
         monkeypatch.setenv(var, str(base))
     monkeypatch.setenv("KGW_AUTOSTART_NO_LOAD", "1")
+    # Nor write the real ~/.local/bin, or download and run the Claude Code installer.
+    monkeypatch.setenv("KGW_COMMAND_DIR", str(base / "bin"))
+    monkeypatch.setenv("KGW_NO_CLAUDE_INSTALL", "1")
     return base
 
 
