@@ -648,6 +648,24 @@ class SecretStore:
             return False, name
         return True, name
 
+    @staticmethod
+    def _part_names(name: str, head: str | None) -> list[str]:
+        """Entry names holding a chunked value's parts: ``kgw-chunked:N`` (legacy, ``name.partI``) or
+        ``kgw-chunked:N:TAG`` (``name.TAG.partI``). Empty for an absent or unchunked value."""
+        if not head or not head.startswith("kgw-chunked:"):
+            return []
+        fields = head.split(":")
+        prefix = f"{name}.{fields[2]}" if len(fields) > 2 else name
+        return [f"{prefix}.part{i}" for i in range(int(fields[1]))]
+
+    def _kr_forget(self, names: Iterable[str]) -> None:
+        kr = self._keyring()
+        for n in names:
+            try:
+                kr.delete_password(self.service, n)
+            except Exception:  # noqa: BLE001 - PasswordDeleteError when absent
+                pass
+
     def _kr_get(self, name: str) -> str | None:
         kr = self._keyring()
         try:
@@ -655,8 +673,7 @@ class SecretStore:
             if head is None:
                 return None
             if head.startswith("kgw-chunked:"):
-                count = int(head.split(":", 1)[1])
-                parts = [kr.get_password(self.service, f"{name}.part{i}") for i in range(count)]
+                parts = [kr.get_password(self.service, n) for n in self._part_names(name, head)]
                 if any(part is None for part in parts):
                     raise GatewayError(f"Stored credential '{name}' is incomplete.",
                                        hint="Update it again with the update-bedrock-key command.")
@@ -671,19 +688,33 @@ class SecretStore:
                                code="keyring_error") from None
 
     def _kr_set(self, name: str, value: str) -> None:
+        """Replace ``name`` without a window in which neither the old nor the new value is stored.
+
+        New parts go under a fresh tag, so the old value's parts stay intact; the single write of the
+        head entry switches over, and only then are the old parts removed. A failure before that
+        switch leaves the old value readable."""
         kr = self._keyring()
         try:
-            self._kr_delete(name)
+            old_parts = self._part_names(name, kr.get_password(self.service, name))
+        except Exception:  # noqa: BLE001 - unreadable old value: nothing to clean up
+            old_parts = []
+        new_parts: list[str] = []
+        try:
             if len(value) > _KEYRING_CHUNK:
-                parts = [value[i:i + _KEYRING_CHUNK] for i in range(0, len(value), _KEYRING_CHUNK)]
-                for i, part in enumerate(parts):
-                    kr.set_password(self.service, f"{name}.part{i}", part)
-                kr.set_password(self.service, name, f"kgw-chunked:{len(parts)}")
+                chunks = [value[i:i + _KEYRING_CHUNK] for i in range(0, len(value), _KEYRING_CHUNK)]
+                head = f"kgw-chunked:{len(chunks)}:{secrets.token_hex(4)}"
+                for part_name, chunk in zip(self._part_names(name, head), chunks):
+                    new_parts.append(part_name)
+                    kr.set_password(self.service, part_name, chunk)
             else:
-                kr.set_password(self.service, name, value)
+                head = value
+            kr.set_password(self.service, name, head)
         except Exception as exc:  # noqa: BLE001
+            self._kr_forget(new_parts)
             raise GatewayError(f"Could not save '{name}' to the system credential store "
-                               f"({exc.__class__.__name__}).", code="keyring_error") from None
+                               f"({exc.__class__.__name__}); the previously stored value was kept.",
+                               code="keyring_error") from None
+        self._kr_forget(p for p in old_parts if p not in new_parts)
 
     def _kr_delete(self, name: str) -> bool:
         kr = self._keyring()
@@ -692,12 +723,10 @@ class SecretStore:
             head = kr.get_password(self.service, name)
         except Exception:  # noqa: BLE001
             head = None
-        if head is not None and head.startswith("kgw-chunked:"):
-            for i in range(int(head.split(":", 1)[1])):
-                try:
-                    kr.delete_password(self.service, f"{name}.part{i}")
-                except Exception:  # noqa: BLE001
-                    pass
+        try:
+            self._kr_forget(self._part_names(name, head))
+        except ValueError:  # malformed head: still delete the head itself
+            pass
         try:
             kr.delete_password(self.service, name)
             removed = True

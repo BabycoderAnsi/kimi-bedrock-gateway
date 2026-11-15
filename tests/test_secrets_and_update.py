@@ -228,3 +228,97 @@ def test_access_key_probe_errors_name_the_key_pair():
     result = validate.classify_bedrock_error(403, {}, b'{"message":"The security token included in the request is invalid."}',
                                              "m", "ap-south-1")
     assert result.code == "invalid_token"  # bearer wording; probe_bedrock rewrites it for AwsKeys
+
+
+class FlakyKeyring:
+    """MemoryKeyring whose ``fail_after``-th set_password call (and later ones) raises."""
+
+    def __init__(self, fail_after=None):
+        from conftest import MemoryKeyring
+
+        self.inner, self.fail_after, self.sets = MemoryKeyring(), fail_after, 0
+        self.data = self.inner.data
+
+    def get_password(self, service, name):
+        return self.inner.get_password(service, name)
+
+    def set_password(self, service, name, value):
+        self.sets += 1
+        if self.fail_after is not None and self.sets > self.fail_after:
+            raise OSError("keychain locked")
+        self.inner.set_password(service, name, value)
+
+    def delete_password(self, service, name):
+        self.inner.delete_password(service, name)
+
+
+@pytest.mark.parametrize("old,new", [("short-old-token", "Y" * 2500),     # short -> chunked
+                                     ("X" * 2500, "Y" * 2500),            # chunked -> chunked
+                                     ("X" * 2500, "short-new-token")],    # chunked -> short
+                         ids=["short-to-chunked", "chunked-to-chunked", "chunked-to-short"])
+def test_failed_keyring_write_keeps_the_old_value(kgw_home, monkeypatch, old, new):
+    kr = FlakyKeyring()
+    monkeypatch.setattr(common.SecretStore, "_keyring", staticmethod(lambda: kr))
+    store = common.SecretStore("keyring")
+    store.set(common.SECRET_BEDROCK_TOKEN, old)
+    before = dict(kr.data)
+    writes = 3 + 1 if len(new) > 1000 else 1  # 3 parts + head, or just the head
+    for fail_after in range(writes):  # fail at each write of the replacement in turn
+        kr.sets, kr.fail_after = 0, fail_after
+        with pytest.raises(common.GatewayError) as exc:
+            store.set(common.SECRET_BEDROCK_TOKEN, new)
+        assert "previously stored value was kept" in str(exc.value)
+        kr.fail_after = None
+        assert store.get(common.SECRET_BEDROCK_TOKEN) == old
+        assert kr.data == before  # no orphaned parts of the half-written value
+    store.set(common.SECRET_BEDROCK_TOKEN, new)
+    assert store.get(common.SECRET_BEDROCK_TOKEN) == new
+    expected_parts = 3 if len(new) > 1000 else 0
+    assert sum(".part" in name for (_, name) in kr.data) == expected_parts  # old parts cleaned up
+
+
+def test_legacy_chunked_entries_still_read_and_are_migrated(kgw_home, memory_keyring):
+    service = common.keyring_service()
+    name = common.SECRET_BEDROCK_TOKEN
+    memory_keyring.data.update({(service, name): "kgw-chunked:2", (service, f"{name}.part0"): "A" * 1000,
+                                (service, f"{name}.part1"): "B" * 10})
+    store = common.SecretStore("keyring")
+    assert store.get(name) == "A" * 1000 + "B" * 10
+    store.set(name, "C" * 1500)
+    assert store.get(name) == "C" * 1500
+    assert (service, f"{name}.part0") not in memory_keyring.data
+    assert memory_keyring.data[(service, name)].count(":") == 2  # kgw-chunked:N:TAG
+    assert store.delete(name) and memory_keyring.data == {}
+
+
+def _classifier_ns(**kw):
+    base = dict(backend="bedrock", model_id=None, base_model=None, separate_credential=True, no_validate=False,
+                replace_token=False, non_interactive=True)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_separate_classifier_key_is_validated_before_it_replaces_the_stored_one(file_store, monkeypatch):
+    s, store = file_store
+    store.set(common.SECRET_CLASSIFIER_BEDROCK_TOKEN, "classifier-old-1111")
+    monkeypatch.setattr(common, "read_secret", lambda _p: "classifier-new-2222")
+    monkeypatch.setattr(validate, "probe_bedrock", _bad("access_denied"))
+    with pytest.raises(common.GatewayError):
+        manage.enable_classifier(_classifier_ns(replace_token=True), s, store)
+    assert store.get(common.SECRET_CLASSIFIER_BEDROCK_TOKEN) == "classifier-old-1111"
+    assert common.load_settings()["classifier"]["backend"] == "none"
+
+    monkeypatch.setattr(validate, "probe_bedrock", _ok)
+    manage.enable_classifier(_classifier_ns(replace_token=True), s, store)
+    assert store.get(common.SECRET_CLASSIFIER_BEDROCK_TOKEN) == "classifier-new-2222"
+
+
+def test_separate_classifier_key_is_reused_unless_replace_token(file_store, monkeypatch):
+    s, store = file_store
+    store.set(common.SECRET_CLASSIFIER_BEDROCK_TOKEN, "classifier-old-1111")
+    probed = []
+    monkeypatch.setattr(common, "read_secret", lambda _p: pytest.fail("must not prompt for a new key"))
+    monkeypatch.setattr(validate, "probe_bedrock", lambda _s, token, *_a, **_k: probed.append(token) or _ok())
+    manage.enable_classifier(_classifier_ns(), s, store)
+    assert probed == ["classifier-old-1111"]
+    assert common.load_settings()["classifier"]["credential"] == "separate"

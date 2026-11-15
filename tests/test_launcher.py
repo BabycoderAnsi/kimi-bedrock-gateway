@@ -119,3 +119,40 @@ def test_proxy_runs_in_utf8_mode_even_with_a_legacy_codepage(kgw_home, monkeypat
     store.set(common.SECRET_MASTER_KEY, "sk-kgw-" + "t" * 30)  # kgw-scan: allow (fake test key)
     env = manage.build_proxy_env(s, store)
     assert env["PYTHONUTF8"] == "1" and env["PYTHONIOENCODING"] == "utf-8"
+
+
+@pytest.mark.parametrize("code,what", [("foreign_listener", "master key"), ("alias_missing", "configuration")])
+def test_launcher_does_not_wait_for_a_stale_gateway(kgw_home, monkeypatch, code, what):
+    import validate
+
+    calls = []
+    monkeypatch.setattr(validate, "proxy_health",
+                        lambda *_a, **_k: validate.ProbeResult(False, code, "rejected", None))
+    monkeypatch.setattr(manage, "proxy_state", lambda _s: {"ours": True, "pid": 4242, "mode": "background",
+                                                          "port_busy": True, "foreign": False})
+    monkeypatch.setattr(manage.time, "sleep", lambda _s: pytest.fail("must not wait for a gateway that won't change"))
+    monkeypatch.setattr(manage, "stop_proxy", lambda *_a, **_k: calls.append("stop"))
+    monkeypatch.setattr(manage, "start_proxy", lambda *_a, **_k: calls.append("start") or 0)
+    args = argparse.Namespace(non_interactive=True)
+    health = manage.ensure_gateway_for_launch(args, settings(), None, "sk-kgw-new")
+    assert health.code == "stale_gateway" and not health.ok and calls == []
+    assert f"older {what}" in health.message and "gateway restart" in health.hint
+
+    # Interactive: offers the restart, and restarts only with consent.
+    monkeypatch.setattr(manage, "interactive", lambda _a: True)
+    monkeypatch.setattr(common, "confirm", lambda *_a, **_k: True)
+    manage.ensure_gateway_for_launch(args, settings(), None, "sk-kgw-new")
+    assert calls == ["stop", "start"]
+
+
+def test_launcher_still_waits_while_a_start_is_in_progress(kgw_home, monkeypatch):
+    import validate
+
+    answers = iter([validate.ProbeResult(False, "alias_missing", "starting"),
+                    validate.ProbeResult(True, "ok", "healthy", detail={"models": ["kimi-k3"]})])
+    monkeypatch.setattr(validate, "proxy_health", lambda *_a, **_k: next(answers))
+    monkeypatch.setattr(manage, "proxy_state", lambda _s: {"ours": True, "pid": 4242, "mode": "background",
+                                                          "port_busy": True, "foreign": False})
+    common.ensure_private_dir(common.paths().start_lock.parent)
+    common.paths().start_lock.write_text("1")
+    assert manage.ensure_gateway_for_launch(argparse.Namespace(non_interactive=True), settings(), None, "k").ok

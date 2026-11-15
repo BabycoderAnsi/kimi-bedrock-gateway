@@ -840,6 +840,10 @@ To configure Auto Mode with a real classifier:
 ./gateway.sh classifier status | disable
 ```
 
+A stored separate or Anthropic key is reused when you run `classifier enable` again. To enter a new one, add
+`--replace-token`. The new key is checked against the classifier model first and saved only if it works;
+otherwise the stored key is kept.
+
 Classifier calls are billed: each reviewed action sends part of the transcript to the classifier model.
 
 ## 8. Troubleshooting: authentication and model access
@@ -864,6 +868,7 @@ Run `./gateway.sh doctor --live` first. Errors are classified as follows:
 | `claude_missing` | Claude Code not installed | see §1 |
 | `claude_broken`: *placeholder* / *Exec format error* on `…/.nvm/…/bin/claude` | npm installed Claude Code but skipped its install step (`ignore-scripts`, `--omit=optional`), leaving a text placeholder instead of the native binary | `curl -fsSL https://claude.ai/install.sh \| bash`, then `npm uninstall -g @anthropic-ai/claude-code`; check that `claude --version` works |
 | Claude Code shows *401*, or *400 No connected db* | Claude Code is using a different key (LiteLLM looks up unknown `sk-…` keys in a database it doesn't have, hence the odd message) | always launch with `claude-kimi`; check `ANTHROPIC_API_KEY` isn't forced elsewhere |
+| `claude-kimi` says *The running gateway (PID …) was started with an older master key* (or *configuration*) | the master key or settings changed, but the gateway wasn't restarted | answer **Y** when the launcher offers a restart, or run `./gateway.sh restart`. After a master-key change, relaunch any Claude Code sessions that were already open |
 | Shift+Tab never shows **auto**; launcher says *Auto mode is DISABLED for this session* | no Auto Mode reviewer is configured, or the running gateway predates it | enable one (`classifier enable …`, see §7), then `./gateway.sh restart` and relaunch Claude Code |
 | *auto mode cannot determine the safety …* / `kgw_classifier_refused` in logs | classifier unreachable, so the gateway kept it off Kimi | `./gateway.sh classifier status`; fix model access, or use Manual mode |
 

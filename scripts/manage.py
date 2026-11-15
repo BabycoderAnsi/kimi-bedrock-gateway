@@ -1104,19 +1104,29 @@ def enable_classifier(args: argparse.Namespace, settings: dict[str, Any], store:
         for issue in common.validate_settings(settings):
             if issue.level == "error" and "classifier" in issue.message.lower():
                 raise GatewayError(issue.message, hint=issue.hint, code="invalid_settings")
+        new_token = None
         if c["credential"] == "separate":
-            value = common.read_secret("Bedrock API key for the classifier model")
-            store.set(common.SECRET_CLASSIFIER_BEDROCK_TOKEN, value)
-        token = (get_secret(store, common.SECRET_CLASSIFIER_BEDROCK_TOKEN) if c["credential"] == "separate"
-                 else bedrock_credential(settings, store))
+            stored = get_secret(store, common.SECRET_CLASSIFIER_BEDROCK_TOKEN)
+            if stored and not getattr(args, "replace_token", False):
+                ok(f"Using the stored classifier Bedrock key (fingerprint {common.fingerprint(stored)}); "
+                   "pass --replace-token to enter a new one.")
+                token = stored
+            else:
+                token = new_token = common.read_secret("Bedrock API key for the classifier model")
+        else:
+            token = bedrock_credential(settings, store)
         if token and not getattr(args, "no_validate", False):
             result = validate.probe_bedrock(settings, token, c["bedrock_model_id"], kind="claude")
             (ok if result.ok else fail)("Classifier model: " + result.message)
             if not result.ok:
                 if result.hint:
                     info("    " + result.hint)
+                if new_token:
+                    info("The previously stored classifier key (if any) was left unchanged.")
                 raise GatewayError("The classifier model is not reachable; auto mode stays disabled.",
                                    code=result.code)
+        if new_token:  # only once it has been validated (or validation was explicitly skipped)
+            store.set(common.SECRET_CLASSIFIER_BEDROCK_TOKEN, new_token)
     else:
         c["anthropic_model"] = getattr(args, "model_id", None) or c.get("anthropic_model") or "claude-sonnet-5"
         key = get_secret(store, common.SECRET_CLASSIFIER_ANTHROPIC_KEY)
@@ -1254,10 +1264,12 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
     master = get_secret(store, common.SECRET_MASTER_KEY)
     health = ensure_gateway_for_launch(args, settings, store, master)
     if not health.ok:
-        if not health.ok:
-            raise GatewayError("The gateway is not healthy; not launching Claude Code.",
-                               hint="Start it with ./start.sh (or .\\start.ps1) and check: gateway doctor",
-                               code=health.code)
+        if health.code == "stale_gateway":
+            fail(health.message)
+        raise GatewayError("The gateway is not healthy; not launching Claude Code.",
+                           hint=health.hint if health.code == "stale_gateway" else
+                           "Start it with ./start.sh (or .\\start.ps1) and check: gateway doctor",
+                           code=health.code)
     ok(health.message)
     classifier_ready = False
     c = settings["classifier"]
@@ -1307,6 +1319,28 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
     return 0  # pragma: no cover
 
 
+# Health codes from our own, fully started gateway that waiting can't fix: it was started with an older
+# master key (it rejects the current one) or an older configuration (it doesn't serve the alias).
+STALE_GATEWAY_CODES = {"foreign_listener": "master key", "alias_missing": "configuration"}
+
+
+def restart_stale_gateway(args: argparse.Namespace, settings: dict[str, Any], store: common.SecretStore,
+                          master: str | None, state: dict[str, Any], health: validate.ProbeResult
+                          ) -> validate.ProbeResult:
+    what = STALE_GATEWAY_CODES[health.code]
+    message = f"The running gateway (PID {state['pid']}) was started with an older {what}."
+    others = ("Claude Code sessions already open must be relaunched afterwards." if what == "master key"
+              else "Open Claude Code sessions reconnect once it is back.")
+    if state["mode"] == "background" and interactive(args) and common.confirm(
+            f"{message} Restart it now? {others}", default=True):
+        stop_proxy(settings, quiet=True)
+        start_proxy(settings, store, background=True)
+        return validate.proxy_health(settings, master)
+    restart = ("gateway restart" if state["mode"] == "background"
+               else "Ctrl+C in its terminal, then ./start.sh or .\\start.ps1")
+    return validate.ProbeResult(False, "stale_gateway", message, f"Restart it ({restart}), then launch again. {others}")
+
+
 def ensure_gateway_for_launch(args: argparse.Namespace, settings: dict[str, Any], store: common.SecretStore,
                               master: str | None) -> validate.ProbeResult:
     """Healthy gateway for the launcher: wait for one that is starting, or start it in the background."""
@@ -1314,7 +1348,10 @@ def ensure_gateway_for_launch(args: argparse.Namespace, settings: dict[str, Any]
     if health.ok:
         return health
     state = proxy_state(settings)
-    starting = state["ours"] or common.paths().start_lock.exists()
+    locked = common.paths().start_lock.exists()
+    if state["ours"] and not locked and health.code in STALE_GATEWAY_CODES:
+        return restart_stale_gateway(args, settings, store, master, state, health)
+    starting = state["ours"] or locked
     if health.code == "not_running" and not starting:
         auto = settings.get("start_gateway_on_launch", True)
         if auto or (interactive(args) and common.confirm("Start the gateway in the background now?", default=True)):
@@ -2003,7 +2040,8 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--base-model", help="for an application-profile ARN: the Claude model behind it "
                                          "(default anthropic.claude-sonnet-5)")
     cl.add_argument("--separate-credential", action="store_true", help="use a separate Bedrock token")
-    cl.add_argument("--replace-token", action="store_true")
+    cl.add_argument("--replace-token", action="store_true",
+                    help="enter a new classifier key instead of reusing the stored one")
     cl.add_argument("--no-validate", action="store_true")
     cl.add_argument("--restart", action="store_true")
 
