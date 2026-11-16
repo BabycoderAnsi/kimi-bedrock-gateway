@@ -322,13 +322,34 @@ def tail_log(n: int = 40) -> list[str]:
     return [common.redact(line) for line in lines[-n:]]
 
 
+LITELLM_MODULE = "litellm.proxy.proxy_cli"  # what the `litellm` console script runs (litellm:run_server)
+
+
 def _litellm_cmd(settings: dict[str, Any]) -> list[str]:
-    exe = common.venv_litellm()
-    if not exe.exists():
-        raise GatewayError(f"LiteLLM is not installed in {common.venv_dir()}.", hint="Run setup.",
+    # Run LiteLLM through the venv's Python, not the `litellm` console script: on Windows that script is
+    # an unsigned launcher pip generates on each machine, which Smart App Control / App Control for
+    # Business (WDAC) block (WinError 4551), while python.exe is signed and already runs these scripts.
+    py = common.venv_python()
+    if not py.exists():
+        raise GatewayError(f"The Python environment {common.venv_dir()} is missing.", hint="Run setup.",
                            code="missing_dependency")
-    return [str(exe), "--config", str(common.paths().runtime_config), "--host", settings["proxy_host"],
-            "--port", str(settings["proxy_port"])]
+    return [str(py), "-m", LITELLM_MODULE, "--config", str(common.paths().runtime_config),
+            "--host", settings["proxy_host"], "--port", str(settings["proxy_port"])]
+
+
+def _spawn_proxy(cmd: list[str], **kwargs: Any) -> subprocess.Popen:
+    try:
+        return subprocess.Popen(cmd, **kwargs)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) in (4551, 1260):  # blocked by App Control / software restriction
+            raise GatewayError(
+                f"Windows blocked {cmd[0]} from running ({exc.strerror}).",
+                hint="An App Control / Smart App Control or group policy rule blocks this program. Ask your "
+                     "administrator to allow Python from python.org (signed by the Python Software "
+                     "Foundation), or install Python from the Microsoft Store, then re-run setup.",
+                code="blocked_by_policy") from None
+        raise GatewayError(f"Could not start the LiteLLM proxy: {exc}", hint="Run: gateway doctor",
+                           code="proxy_error") from None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -402,7 +423,7 @@ def _start_proxy_locked(settings: dict[str, Any], store: common.SecretStore, bac
         info(f"Starting LiteLLM proxy in the foreground on {validate.proxy_base_url(settings)} "
              f"(model alias '{settings['model_alias']}' -> {settings['bedrock_model_id']} in {settings['aws_region']}).")
         info("Press Ctrl+C to stop.\n")
-        proc = subprocess.Popen(cmd, env=env)
+        proc = _spawn_proxy(cmd, env=env)
         common.write_pid(proc.pid, settings, "foreground", p)
         release_start_lock(p)  # the PID file now marks it as ours; don't hold the lock for hours
         try:
@@ -426,8 +447,10 @@ def _start_proxy_locked(settings: dict[str, Any], store: common.SecretStore, bac
                                    | subprocess.CREATE_NO_WINDOW)
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kwargs)
-    logf.close()
+    try:
+        proc = _spawn_proxy(cmd, **kwargs)
+    finally:
+        logf.close()
     common.write_pid(proc.pid, settings, "background", p)
     master = env["LITELLM_MASTER_KEY"]
     deadline = time.time() + STARTUP_TIMEOUT

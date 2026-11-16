@@ -3,6 +3,7 @@
 import json
 import socket
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -130,3 +131,22 @@ def test_stop_does_not_touch_foreign_process(kgw_home, port, capsys):
         sock.listen(1)
         assert manage.stop_proxy(_settings(port)) is False
     assert "not this gateway" in capsys.readouterr().out
+
+
+def test_proxy_runs_through_the_venv_python_not_the_console_script(kgw_home):
+    """Windows App Control blocks pip's unsigned litellm.exe launcher (WinError 4551); python.exe is signed."""
+    cmd = manage._litellm_cmd(common.default_settings())
+    assert cmd[:3] == [str(common.venv_python()), "-m", manage.LITELLM_MODULE]
+    assert not any(Path(c).name.lower() in ("litellm", "litellm.exe") for c in cmd)
+
+
+def test_a_policy_block_is_reported_clearly(monkeypatch):
+    def blocked(*_a, **_k):
+        exc = OSError(None, "An Application Control policy has blocked this file")
+        exc.winerror = 4551
+        raise exc
+
+    monkeypatch.setattr(manage.subprocess, "Popen", blocked)
+    with pytest.raises(common.GatewayError) as err:
+        manage._spawn_proxy(["python.exe", "-m", manage.LITELLM_MODULE])
+    assert err.value.code == "blocked_by_policy" and "administrator" in err.value.hint

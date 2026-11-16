@@ -249,13 +249,6 @@ def venv_python(venv: Path | None = None) -> Path:
     return venv / "bin" / "python"
 
 
-def venv_litellm(venv: Path | None = None) -> Path:
-    venv = venv or venv_dir()
-    if os.name == "nt":
-        return venv / "Scripts" / "litellm.exe"
-    return venv / "bin" / "litellm"
-
-
 # --------------------------------------------------------------------- permissions
 
 
