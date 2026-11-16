@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common  # noqa: E402
 import autostart  # noqa: E402
 import userbin  # noqa: E402
+import updates  # noqa: E402
 import validate  # noqa: E402
 from common import GatewayError  # noqa: E402
 
@@ -869,8 +870,11 @@ def report_claude(plat: common.PlatformInfo) -> None:
     if parsed and parsed < common.MIN_CLAUDE_CODE:
         warn(f"Claude Code {version} at {claude} is older than the minimum supported "
              f"{'.'.join(map(str, common.MIN_CLAUDE_CODE))}; run: claude update")
+    elif updates.is_verified("claude_code", version):
+        ok(f"Claude Code {version} at {claude} (verified with this gateway)")
     else:
-        ok(f"Claude Code {version or '(unknown version)'} at {claude} (tested: {common.TESTED_CLAUDE_CODE})")
+        warn(f"Claude Code {version or '(unknown version)'} at {claude} hasn't been verified with this gateway "
+             f"(release tested with {common.TESTED_CLAUDE_CODE}). Run: gateway verify claude")
 
 
 # ---------------------------------------------------------------- credentials
@@ -1261,6 +1265,9 @@ def cmd_launch_claude(args: argparse.Namespace) -> int:
     parsed = common.parse_version(version or "")
     if parsed and parsed < common.MIN_CLAUDE_CODE:
         warn(f"Claude Code {version} is older than {'.'.join(map(str, common.MIN_CLAUDE_CODE))}; run 'claude update'.")
+    elif parsed and not updates.is_verified("claude_code", version):
+        info(f"Claude Code {version} hasn't been checked against this gateway yet (it updates itself). "
+             "To check it, offline, in about a minute: gateway verify claude")
     master = get_secret(store, common.SECRET_MASTER_KEY)
     health = ensure_gateway_for_launch(args, settings, store, master)
     if not health.ok:
@@ -1607,6 +1614,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         lite = installed_litellm_version()
         (ok if lite == common.load_settings()["litellm_version"] else warn)(
             f"LiteLLM {lite} installed (configured {common.load_settings()['litellm_version']})")
+        if lite and not updates.is_verified("litellm", lite):
+            warn(f"LiteLLM {lite} hasn't been verified with this gateway. Run: gateway verify litellm")
         if plat.system == "Darwin" and "arm64" not in venv_ver and plat.machine == "arm64":
             warn("The venv Python is not arm64 on Apple Silicon (running under Rosetta).")
     else:
@@ -1778,74 +1787,321 @@ def cmd_scan_secrets(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------ upgrade
 
 
+# ------------------------------------------------------- updates & verification
+
+
+def dev_tool_requirements() -> list[str]:
+    """requirements-dev.txt minus its ``-r requirements.txt`` line: installing that line again would put the
+    pinned LiteLLM back over the version being tested (pip downgrades to satisfy the pin)."""
+    lines = (common.REPO_ROOT / "requirements-dev.txt").read_text(encoding="utf-8").splitlines()
+    return [ln.split("#", 1)[0].strip() for ln in lines
+            if ln.split("#", 1)[0].strip() and not ln.strip().startswith(("-r", "--requirement"))]
+
+
+def venv_litellm_version(py: Path) -> str | None:
+    out = subprocess.run([str(py), "-c", "from importlib.metadata import version; print(version('litellm'))"],
+                         capture_output=True, text=True, timeout=60, check=False)
+    return out.stdout.strip() or None
+
+
+def ensure_test_tools(py: Path) -> None:
+    if subprocess.run([str(py), "-c", "import pytest"], capture_output=True, check=False).returncode == 0:
+        return
+    step("Installing the test tools (pytest) into the gateway's virtual environment")
+    result = subprocess.run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check",
+                             *dev_tool_requirements()], check=False)
+    if result.returncode != 0:
+        raise GatewayError("Could not install the test tools (see pip output above).", code="pip_failed")
+
+
+def run_contract_check(py: Path, settings: dict[str, Any]) -> bool:
+    """gateway/litellm_contract.py in the given venv: what the hooks need from LiteLLM is still there."""
+    proc = subprocess.run([str(py), str(common.REPO_ROOT / "gateway" / "litellm_contract.py"),
+                           "--model", settings["bedrock_model_id"], "--api", settings["kimi_api"]],
+                          capture_output=True, text=True, timeout=300, check=False)
+    try:
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        last = (proc.stderr or "no output").strip().splitlines()
+        fail("The LiteLLM compatibility check could not run: " + common.redact(last[-1] if last else "no output"))
+        return False
+    for c in report["checks"]:
+        (ok if c["ok"] else warn if c["level"] == "warning" else fail)(f"LiteLLM {report['litellm']}: {c['detail']}")
+    return proc.returncode == 0
+
+
+def run_offline_tests(py: Path, venv: Path, marker: str, extra_env: dict[str, str] | None = None) -> bool:
+    """The repo's tests against ``venv``: real LiteLLM proxy + hooks (+ real Claude Code) vs the mock Bedrock.
+    No AWS access, no real credentials, and each test uses its own state directory and ports."""
+    env = {**os.environ, "KGW_VENV": str(venv), "KGW_NO_REEXEC": "1", **(extra_env or {})}
+    env.pop("KGW_HOME", None)
+    info(f"    Running the offline tests ({marker}); this takes a few minutes ...")
+    return subprocess.call([str(py), "-m", "pytest", "-q", "-m", marker, str(common.REPO_ROOT / "tests")],
+                           env=env, cwd=common.REPO_ROOT) == 0
+
+
+def verify_litellm(py: Path, venv: Path, settings: dict[str, Any], expected: str | None = None) -> bool:
+    version = venv_litellm_version(py)
+    if expected and version != expected:
+        fail(f"The environment has LiteLLM {version}, not {expected}.")
+        return False
+    if not run_contract_check(py, settings):
+        return False
+    ensure_test_tools(py)
+    if expected and venv_litellm_version(py) != expected:  # nothing may have replaced it since
+        fail(f"Installing the test tools changed LiteLLM to {venv_litellm_version(py)}.")
+        return False
+    return run_offline_tests(py, venv, "not live")
+
+
+def rollback_litellm(settings: dict[str, Any]) -> str | None:
+    venv = common.venv_dir()
+    previous = venv.with_name(venv.name + PREVIOUS_SUFFIX)
+    if not previous.exists():
+        raise GatewayError("No previous virtual environment to roll back to.", code="nothing_to_rollback")
+    stop_proxy(settings, quiet=True)
+    failed = venv.with_name(venv.name + ".failed")
+    shutil.rmtree(failed, ignore_errors=True)
+    if venv.exists():
+        venv.rename(failed)
+    previous.rename(venv)
+    shutil.rmtree(failed, ignore_errors=True)
+    ver = installed_litellm_version()
+    settings["litellm_version"] = ver or common.PINNED_LITELLM
+    common.save_settings(settings, common.paths())
+    return ver
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     settings, store = load()
     venv = common.venv_dir()
     previous = venv.with_name(venv.name + PREVIOUS_SUFFIX)
     if args.rollback:
-        if not previous.exists():
-            raise GatewayError("No previous virtual environment to roll back to.", code="nothing_to_rollback")
-        stop_proxy(settings, quiet=True)
-        failed = venv.with_name(venv.name + ".failed")
-        shutil.rmtree(failed, ignore_errors=True)
-        venv.rename(failed)
-        previous.rename(venv)
-        shutil.rmtree(failed, ignore_errors=True)
-        ver = installed_litellm_version()
-        settings["litellm_version"] = ver or common.PINNED_LITELLM
-        common.save_settings(settings, common.paths())
-        ok(f"Rolled back to LiteLLM {ver}. Start the gateway again.")
+        was = proxy_state(settings)
+        ver = rollback_litellm(settings)
+        ok(f"Rolled back to LiteLLM {ver}.")
+        if was["ours"] and was["mode"] == "background":
+            start_proxy(settings, store, background=True)
+        else:
+            info("Start the gateway again when you need it (claude-kimi does this on demand).")
         return 0
-    target = args.litellm
     current = installed_litellm_version()
-    info(f"Upgrade LiteLLM {current} -> {target} (tested version: {common.PINNED_LITELLM}).")
+    target = args.litellm
+    if not target:
+        latest = updates.latest_litellm()
+        target = latest["version"]
+        info(f"Latest stable LiteLLM on PyPI: {target} (released {latest['released']}).")
+    if target == current:
+        ok(f"LiteLLM {target} is already installed"
+           + (" and verified." if updates.is_verified("litellm", target) else "; check it with: gateway verify litellm"))
+        return 0
+    info(f"Upgrade LiteLLM {current} -> {target} (tested with this release: {common.PINNED_LITELLM}).")
     if re.search(r"[a-z]", target) and not args.allow_prerelease:
         raise GatewayError(f"{target} looks like a pre-release.", hint="Pass --allow-prerelease to try it anyway "
                            "(experimental; not recommended for daily use).", code="prerelease")
-    if not args.yes and not (interactive(args) and common.confirm("Continue?", default=False)):
+    info("The new version is built and tested in a separate environment first; the current one keeps running.")
+    if not args.yes and not (interactive(args) and common.confirm("Continue?", default=True)):
         return 1
     dest = backup_settings("upgrade")
-    info(f"Backed up configuration to {dest}")
+    if dest:
+        info(f"Backed up configuration to {dest}")
     staging = venv.with_name(".venv-upgrade")
     shutil.rmtree(staging, ignore_errors=True)
     trial = dict(settings, litellm_version=target)
     install_requirements(staging, trial)
-    py = str(common.venv_python(staging))
-    step("Compatibility checks in the staging environment")
-    # LiteLLM cannot see the model behind an application-profile ARN; check the Kimi ID it would serve.
-    lookaround_model = "moonshotai.kimi-k3" if common.is_application_profile(settings["bedrock_model_id"]) \
-        else settings["bedrock_model_id"]
-    check = subprocess.run([py, "-c", (
-        "import json, litellm, importlib.metadata as m\n"
-        "from litellm.llms.bedrock.common_utils import bedrock_model_supports_regex_lookaround as f\n"
-        f"print(json.dumps({{'version': m.version('litellm'), 'drops_lookaround': not f({lookaround_model!r})}}))")],
-        capture_output=True, text=True, timeout=300, check=False, env={**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"})
-    if check.returncode != 0:
-        fail("The staged LiteLLM lacks APIs the gateway relies on:")
-        info("    " + common.redact((check.stderr or "").strip().splitlines()[-1] if check.stderr else "unknown error"))
+    step(f"Checking LiteLLM {target} against this gateway (compatibility check + offline end-to-end tests)")
+    if not verify_litellm(common.venv_python(staging), staging, settings, expected=target):
+        fail("LiteLLM checks failed; the current installation was left untouched.")
         shutil.rmtree(staging, ignore_errors=True)
         return 1
-    result = json.loads(check.stdout.strip().splitlines()[-1])
-    (ok if result["drops_lookaround"] else fail)(
-        f"LiteLLM {result['version']} {'drops' if result['drops_lookaround'] else 'does NOT drop'} look-around "
-        f"regexes from tool schemas for {lookaround_model}")
-    subprocess.run([py, "-m", "pip", "install", "-q", "-r", str(common.REPO_ROOT / "requirements-dev.txt")],
-                   check=False)
-    tests = subprocess.run([py, "-m", "pytest", "-q", "-m", "not e2e and not live", str(common.REPO_ROOT / "tests")],
-                           check=False, env={**os.environ, "KGW_VENV": str(staging), "KGW_NO_REEXEC": "1"})
-    if tests.returncode != 0 or not result["drops_lookaround"]:
-        fail("Compatibility checks failed; the current installation was left untouched.")
-        shutil.rmtree(staging, ignore_errors=True)
-        return 1
+    was = proxy_state(settings)
     stop_proxy(settings, quiet=True)
     shutil.rmtree(previous, ignore_errors=True)
-    venv.rename(previous)
+    if venv.exists():
+        venv.rename(previous)
     staging.rename(venv)
     settings["litellm_version"] = target
     common.save_settings(settings, common.paths())
-    ok(f"Upgraded to LiteLLM {target}. Previous environment kept at {previous} (gateway upgrade --rollback).")
-    info("Start the gateway and run 'gateway health --live' to verify against Bedrock.")
+    updates.record_verified("litellm", target, "contract+offline-e2e")
+    ok(f"Switched to LiteLLM {target}. The previous environment is kept for: gateway upgrade --rollback")
+    try:
+        if was["ours"] and was["mode"] == "background":
+            start_proxy(settings, store, background=True)
+        live_ok = True
+        if getattr(args, "live", False) or interactive(args):
+            step("Live check against Amazon Bedrock")
+            live_ok = run_gateway_selftest(args, settings, store)
+        else:
+            warn("Not checked against the real Bedrock yet. Run: gateway health --live")
+    except GatewayError as exc:
+        fail(str(exc))
+        live_ok = False
+    if not live_ok:
+        warn(f"LiteLLM {target} passed the offline checks but failed with the real gateway; rolling back.")
+        updates.forget_verified("litellm", target)
+        ver = rollback_litellm(settings)
+        ok(f"Rolled back to LiteLLM {ver}.")
+        if was["ours"] and was["mode"] == "background":
+            start_proxy(settings, store, background=True)
+        return 1
     return 0
+
+
+def _claude_install_kind(claude: str) -> str:
+    return "npm" if "node_modules" in str(Path(claude).resolve()) else "native"
+
+
+def claude_rollback_command(claude: str, version: str) -> list[str]:
+    if _claude_install_kind(claude) == "npm":
+        return ["npm", "install", "-g", f"@anthropic-ai/claude-code@{version}"]
+    return [claude, "install", version]
+
+
+def verify_claude(claude: str) -> bool:
+    """Claude Code's own end-to-end tests: chat, a Bash tool call, and the auto-mode reviewer requests
+    (recognised, routed, refused on Kimi, or disabled), all against the mock Bedrock."""
+    py = common.venv_python()
+    ensure_test_tools(py)
+    return run_offline_tests(py, common.venv_dir(), "claude",
+                             {"KGW_REQUIRE_CLAUDE": "1", "KGW_CLAUDE_BIN": claude})
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    settings, _ = load()
+    if args.target == "litellm":
+        py = common.venv_python()
+        version = venv_litellm_version(py)
+        step(f"Checking LiteLLM {version} against this gateway (compatibility check + offline end-to-end tests)")
+        if not verify_litellm(py, common.venv_dir(), settings):
+            fail(f"LiteLLM {version} did not pass; see above.")
+            return 1
+        updates.record_verified("litellm", version, "contract+offline-e2e")
+        ok(f"LiteLLM {version} verified with this gateway.")
+        return 0
+    claude = validate.find_claude()
+    if not claude or validate.claude_is_npm_placeholder(claude):
+        raise GatewayError("Claude Code is not installed.", hint=validate.claude_install_hint(
+            common.detect_platform().system), code="claude_missing")
+    version = validate.claude_version(claude)
+    step(f"Checking Claude Code {version} against this gateway (offline; your ~/.claude is not used)")
+    if not verify_claude(claude):
+        fail(f"Claude Code {version} did not pass. claude-kimi may misbehave, especially in Auto Mode.")
+        return 1
+    updates.record_verified("claude_code", version, "offline-e2e")
+    ok(f"Claude Code {version} verified with this gateway.")
+    return 0
+
+
+def _print_update_report(report: dict[str, Any]) -> None:
+    def verified(item: dict[str, Any]) -> str:
+        return "verified" if item["verified"] else "NOT verified"
+
+    lite, claude = report["litellm"], report["claude_code"]
+    line = f"    {'LiteLLM':<12}: installed {lite['installed'] or 'none'} ({verified(lite)})"
+    if "error" in lite:
+        line += f"; latest unknown: {lite['error']}"
+    elif lite.get("latest"):
+        line += f"; latest stable {lite['latest']} ({lite['released']})"
+    info(line)
+    line = f"    {'Claude Code':<12}: installed {claude['installed'] or 'none'} ({verified(claude)})"
+    if "error" in claude:
+        line += f"; latest unknown: {claude['error']}"
+    elif claude.get("latest"):
+        line += f"; latest {claude['latest']}, stable {claude.get('stable', '?')}"
+    info(line)
+
+
+def _update_report() -> dict[str, Any]:
+    claude = validate.find_claude()
+    claude_ver = validate.claude_version(claude) if claude and not validate.claude_is_npm_placeholder(claude) else None
+    return updates.check(installed_litellm_version(), claude_ver)
+
+
+def cmd_check_updates(args: argparse.Namespace) -> int:
+    report = _update_report()
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    info("Versions (only public version lists were read: pypi.org and registry.npmjs.org)")
+    _print_update_report(report)
+    lite, claude = report["litellm"], report["claude_code"]
+    hints = []
+    if lite.get("update_available"):
+        hints.append("gateway update litellm")
+    elif lite["installed"] and not lite["verified"]:
+        hints.append("gateway verify litellm")
+    if claude.get("update_available"):
+        hints.append("gateway update claude")
+    elif claude["installed"] and not claude["verified"]:
+        hints.append("gateway verify claude")
+    info("Next: " + "   |   ".join(hints) if hints else "Everything is up to date and verified.")
+    return 0
+
+
+def update_claude(args: argparse.Namespace, item: dict[str, Any]) -> int:
+    claude = validate.find_claude()
+    old = item["installed"]
+    if item.get("update_available"):
+        if not args.yes and not (interactive(args) and common.confirm(
+                f"Update Claude Code {old} -> {item['latest']}? It's then checked against the gateway.", default=True)):
+            return 0
+        step("Updating Claude Code (claude update)")
+        subprocess.call([claude, "update"])
+        claude = validate.find_claude() or claude
+        new = validate.claude_version(claude)
+        if new == old:
+            warn(f"Claude Code is still {old}; nothing to verify.")
+            return 1
+        ok(f"Claude Code {old} -> {new}")
+    else:
+        new = old
+        if item["verified"]:
+            ok(f"Claude Code {new} is up to date and verified.")
+            return 0
+    step(f"Checking Claude Code {new} against this gateway (offline; your ~/.claude is not used)")
+    if verify_claude(claude):
+        updates.record_verified("claude_code", new, "offline-e2e")
+        ok(f"Claude Code {new} verified with this gateway.")
+        return 0
+    fail(f"Claude Code {new} did not pass the gateway's checks; claude-kimi may misbehave, especially in Auto Mode.")
+    if old and new != old:
+        back = claude_rollback_command(claude, old)
+        info("    To go back: " + " ".join(back))
+        if interactive(args) and common.confirm(f"Go back to Claude Code {old} now?", default=True):
+            if subprocess.call(back) == 0:
+                ok(f"Back on Claude Code {old}. Claude Code may update itself again; it auto-updates unless "
+                   "you turn that off in its own settings.")
+    return 1
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    report = _update_report()
+    _print_update_report(report)
+    status = 0
+    lite, claude = report["litellm"], report["claude_code"]
+    if args.target in ("all", "litellm"):
+        if "error" in lite:
+            warn(f"Skipping LiteLLM: {lite['error']}")
+        elif lite.get("update_available"):
+            want = args.yes or (interactive(args) and common.confirm(
+                f"Upgrade LiteLLM {lite['installed']} -> {lite['latest']}? It's built and tested before it "
+                "replaces the current one.", default=True))
+            if want:
+                status |= cmd_upgrade(argparse.Namespace(
+                    litellm=lite["latest"], allow_prerelease=False, rollback=False, yes=True, live=args.live,
+                    non_interactive=args.non_interactive))
+        elif not lite["verified"]:
+            info("    LiteLLM is current but not verified on this machine: gateway verify litellm")
+        else:
+            ok(f"LiteLLM {lite['installed']} is up to date and verified.")
+    if args.target in ("all", "claude"):
+        if not claude["installed"]:
+            info("    Claude Code is not installed; setup can install it.")
+        elif "error" in claude and claude["verified"]:
+            warn(f"Skipping Claude Code: {claude['error']}")
+        else:
+            status |= update_claude(args, claude)
+    return status
 
 
 # ---------------------------------------------------------------- uninstall
@@ -2059,10 +2315,20 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--no-store", action="store_true", help="don't compare against stored credential values")
 
     up = sub.add_parser("upgrade", help="upgrade LiteLLM in a staging venv with compatibility checks")
-    up.add_argument("--litellm", default=common.PINNED_LITELLM)
+    up.add_argument("--litellm", help="version to install (default: the latest stable release on PyPI)")
     up.add_argument("--allow-prerelease", action="store_true")
     up.add_argument("--rollback", action="store_true")
     up.add_argument("--yes", action="store_true")
+    up.add_argument("--live", action="store_true",
+                    help="after switching, send one tiny billed request through the gateway; roll back if it fails")
+    cu = sub.add_parser("check-updates", help="show available LiteLLM / Claude Code updates (changes nothing)")
+    cu.add_argument("--json", action="store_true")
+    ud = sub.add_parser("update", help="update LiteLLM and/or Claude Code, verifying each against the gateway")
+    ud.add_argument("target", nargs="?", choices=["all", "litellm", "claude"], default="all")
+    ud.add_argument("--yes", action="store_true", help="apply available updates without asking")
+    ud.add_argument("--live", action="store_true", help="LiteLLM: also check against the real Bedrock (billed)")
+    vf = sub.add_parser("verify", help="check the installed LiteLLM or Claude Code against the gateway (offline)")
+    vf.add_argument("target", choices=["litellm", "claude"])
 
     un = sub.add_parser("uninstall", help="remove generated files (credentials kept unless requested)")
     un.add_argument("--remove-venv", action="store_true")
@@ -2078,6 +2344,7 @@ COMMANDS = {
     "update-key": cmd_update_key, "set-auth": cmd_set_auth, "autostart": cmd_autostart, "command": cmd_command, "rotate-master-key": cmd_rotate_master_key, "set-region": cmd_set_region,
     "classifier": cmd_classifier, "launch-claude": cmd_launch_claude, "_claude-env": cmd_internal_claude_env,
     "doctor": cmd_doctor, "scan-secrets": cmd_scan_secrets, "upgrade": cmd_upgrade, "uninstall": cmd_uninstall,
+    "check-updates": cmd_check_updates, "update": cmd_update, "verify": cmd_verify,
 }
 
 

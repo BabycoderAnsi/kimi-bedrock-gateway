@@ -243,7 +243,10 @@ On Windows, use the `.ps1` version of each script (`.\gateway.ps1 <command>`).
 | Rotate the local master key | `./gateway.sh rotate-master-key` |
 | Show or validate settings | `./gateway.sh config show` / `config validate` |
 | Scan the repo for leaked secrets | `./gateway.sh scan-secrets` |
-| Upgrade LiteLLM safely | `./gateway.sh upgrade [--rollback]` |
+| See available LiteLLM / Claude Code updates | `./gateway.sh check-updates` (changes nothing) |
+| Update and check against the gateway | `./gateway.sh update [litellm\|claude] [--yes] [--live]` |
+| Check what's installed now (offline) | `./gateway.sh verify litellm` / `verify claude` |
+| Upgrade or roll back LiteLLM | `./gateway.sh upgrade [--litellm X.Y.Z] [--live]` / `upgrade --rollback` |
 | Remove everything | `./uninstall.sh [--remove-venv --remove-config --remove-credentials]` |
 
 ### Settings reference
@@ -916,25 +919,71 @@ If you still see the regex error: `./gateway.sh version` must report LiteLLM ≥
 
 ## 10. Updating dependencies safely
 
-Versions are pinned in `requirements.txt`. Development tools are in `requirements-dev.txt`.
-Experimental options are documented separately in `requirements-experimental.txt` and are **never
-installed by default**.
+LiteLLM and Claude Code both release often. The gateway depends on details of each: its hooks plug
+into LiteLLM's request pipeline, and the launcher relies on how Claude Code sends Auto Mode reviewer
+requests. Every update is therefore **checked against the gateway** before you rely on it.
 
 ```bash
-./gateway.sh upgrade --litellm 1.107.0          # stable releases only, unless --allow-prerelease
-./gateway.sh upgrade --rollback                  # return to the previous environment
+./gateway.sh check-updates          # what's installed, what's available, what's verified (changes nothing)
+./gateway.sh update                 # offers each available update, then checks it
+./gateway.sh update litellm --live  # LiteLLM only, plus one tiny billed request through the real gateway
+./gateway.sh update claude          # Claude Code only
+./gateway.sh verify litellm         # check what's installed now, offline
+./gateway.sh verify claude
 ```
 
-`upgrade` works like this:
+`check-updates` and `update` read only two public version lists: PyPI's (LiteLLM) and npm's (Claude
+Code). They send no credentials, settings or details about your machine.
 
-1. Backs up your settings.
-2. Builds a **separate staging venv** with the new version.
-3. Checks that the version still drops look-around for your Kimi profile.
-4. Runs the unit tests against the staging venv.
-5. Only then swaps it in, keeping the old venv as `.venv.previous`.
+#### LiteLLM: `update litellm`, or `upgrade [--litellm X.Y.Z]`
 
-Afterwards run `./gateway.sh health --live`. Re-running setup reinstalls automatically when the
-pinned versions change.
+The gateway keeps running on the current version until the new one has passed every check:
+
+1. Backs up your settings and builds the new version in a **separate staging environment**.
+2. Runs the **compatibility check** (`gateway/litellm_contract.py`). It confirms that everything the
+   hooks need from LiteLLM is still there:
+   * the hook methods and their signatures;
+   * the proxy and auth-error imports;
+   * look-around regexes still being dropped for your Kimi profile;
+   * tool calls staying on Chat Completions, where the low reasoning effort applies.
+
+   Several hooks fall back silently on purpose, so a LiteLLM change can't take the gateway down. This
+   check is where such changes show up.
+3. Runs the **full offline test suite** in the staging environment. This includes the end-to-end
+   tests that start the real new LiteLLM proxy, with the hooks, against a mock Bedrock: Chat
+   Completions with effort and cache markers, Converse behind an ARN, access-key signing, the Auto
+   Mode guard, stop sequences and replayed reasoning.
+4. Only then swaps it in, keeping the old environment as `.venv.previous`, and restarts a running
+   background gateway.
+5. With `--live`, or when you agree at the prompt, it sends one tiny request to the real Bedrock
+   through the gateway. If that fails, it **rolls back automatically**.
+
+Any failure before step 4 leaves your installation untouched. To go back later, run
+`./gateway.sh upgrade --rollback`. Without `--litellm`, `upgrade` picks the newest stable release on
+PyPI. Pre-releases need `--allow-prerelease`.
+
+#### Claude Code: `update claude`
+
+Claude Code **updates itself** in the background, so the gateway can't hold it at a tested version
+without changing your own Claude Code settings, which it never does. Instead:
+
+* `claude-kimi` prints a one-line note when the Claude Code it's about to start hasn't been verified,
+  and `doctor` shows the same.
+* `verify claude` runs Claude Code's end-to-end tests: chat, a Bash tool call, and each Auto Mode
+  path (reviewer requests recognized and routed, refused on Kimi, and Auto Mode disabled when no
+  reviewer is set up). It takes about a minute. Your real Claude Code runs against the mock Bedrock,
+  with a separate config folder: **your `~/.claude` is not used**, and there are no Bedrock charges.
+* `update claude` runs `claude update`, then the same checks. If they fail, it shows how to go back
+  (`claude install <previous version>`, or `npm install -g @anthropic-ai/claude-code@<version>` for npm
+  installs) and offers to do it.
+
+The most important check covers Auto Mode. If a Claude Code release changed how it sends reviewer
+requests, the gateway might no longer recognize them. A failed `verify claude` tells you to stay out
+of Auto Mode until that's fixed.
+
+Verified versions are recorded per machine in `verified.json`, in the gateway's state folder. The
+versions this release was tested with count as verified. Re-running setup reinstalls automatically
+when the pinned versions in `requirements.txt` change.
 
 ## 11. Uninstall
 
@@ -969,6 +1018,10 @@ or anything else.
   download (`LITELLM_LOCAL_MODEL_COST_MAP`).
 * **Credential validation goes only to AWS** (or to the Anthropic API for that classifier backend).
   Redirects are never followed with credentials attached.
+* **Update checks read only public version lists.** `check-updates` and `update` send a GET to
+  pypi.org (LiteLLM) and registry.npmjs.org (Claude Code), with no credentials or machine details.
+  Updates are installed only when you agree, or with `--yes`. LiteLLM comes from PyPI through pip,
+  and Claude Code through its own `claude update`.
 * **No system-wide changes.** No `sudo`, no administrator rights, no execution-policy change, and no
   machine-wide PATH or global environment edits. Windows ACLs are set only on the gateway's own files.
   The only per-user changes are those you agree to in setup:
@@ -993,8 +1046,8 @@ or anything else.
 
 | Component | Version |
 |---|---|
-| LiteLLM | **1.106.0** (stable; 1.105.1 is affected by the regex issue) |
-| Claude Code | **2.1.303** and **2.1.310** tested; ≥ 2.1.288 required |
+| LiteLLM | **1.106.0** (stable; 1.105.1 is affected by the regex issue). **1.109.1** passed every `upgrade` check offline (2026-11-15), but not yet against the real Bedrock |
+| Claude Code | **2.1.303** and **2.1.310** tested live; **2.1.325** passed `verify claude` (offline); ≥ 2.1.288 required |
 | Python | 3.11 – 3.14 supported; **tested on 3.14.7** |
 | keyring / psutil / prisma | 25.7.0 / 7.2.2 / 0.15.0 |
 | Bedrock model | `in.moonshotai.kimi-k3` (also `us.`/`global.`), or an application-profile ARN; auth by Bedrock API key (bearer) or IAM access key pair (SigV4) |
@@ -1002,9 +1055,9 @@ or anything else.
 **What has actually been tested**
 
 * ✅ **macOS 27 on Apple Silicon (arm64)**, Python 3.14.7.
-  * **Automated:** 164 tests: 146 unit tests and 18 offline end-to-end tests. The end-to-end tests
+  * **Automated:** 204 tests: 184 unit tests and 20 offline end-to-end tests. The end-to-end tests
     use a real LiteLLM proxy, real Claude Code and a mocked Bedrock that reproduces Kimi K3's
-    documented failures and verifies SigV4 signatures. In the latest run 163 passed and 1 was skipped:
+    documented failures and verifies SigV4 signatures. In the latest run 203 passed and 1 was skipped:
     the PowerShell parser check, because `pwsh` wasn't installed (it passed with PowerShell 7.6 in an
     earlier run). `shellcheck` is clean.
   * **Live against real Bedrock** (2026-10-26):

@@ -23,7 +23,7 @@ from conftest import ROOT, free_port
 pytestmark = pytest.mark.e2e
 FAKE_TOKEN = "mock-valid-token"  # kgw-scan: allow (only the local mock accepts it)
 VENV_PY = Path(os.environ.get("KGW_VENV", ROOT / ".venv")) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-CLAUDE = shutil.which("claude")
+CLAUDE = os.environ.get("KGW_CLAUDE_BIN") or shutil.which("claude")
 
 
 class Gateway:
@@ -131,6 +131,11 @@ def test_multi_turn_with_reasoning_and_lookaround_tool_succeeds(gateway):
     assert not any(m.get("reasoning_content") for m in sent["messages"])  # prior reasoning removed
     assert "(?!" not in json.dumps(sent["tools"])  # look-around dropped (LiteLLM only does this on Converse)
     assert len(sent["tools"]) == 1
+    # Prompt-cache breakpoints (added by the deployment hook) reach Bedrock: system prompt + latest user turn.
+    marked = [m["role"] for m in sent["messages"] if isinstance(m.get("content"), list)
+              and any(isinstance(c, dict) and c.get("prompt_cache_breakpoint") for c in m["content"])]
+    assert marked[-1:] == ["user"], sent["messages"]
+    assert sent.get("prompt_cache_key", "").startswith("kgw-")
 
 
 def test_converse_fallback_setting(tmp_path):
@@ -285,7 +290,14 @@ def _claude(gw: Gateway, workdir: Path, *args: str, launcher_flags: tuple[str, .
     return json.loads(lines[-1])
 
 
-needs_claude = pytest.mark.skipif(not CLAUDE, reason="Claude Code not installed")
+# `gateway verify claude` runs these (-m claude) with KGW_REQUIRE_CLAUDE=1, so a missing Claude Code
+# fails the check instead of skipping it.
+_skip_without_claude = pytest.mark.skipif(not CLAUDE and os.environ.get("KGW_REQUIRE_CLAUDE") != "1",
+                                          reason="Claude Code not installed")
+
+
+def needs_claude(test):
+    return pytest.mark.claude(_skip_without_claude(test))
 
 
 @needs_claude
